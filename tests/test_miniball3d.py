@@ -4,6 +4,12 @@
 不 import、不调用被测核心的任何函数；被测核心用的是仿射包内的
 Gram 方程 + 高斯消元，二者代码路径相互独立。两套实现只在测试里
 逐字段对照。对偶恒等式与证书条件做精确（Fraction）核验。
+
+输入球（minimum_enclosing_ball）部分的期望值全部独立得出：
+一维用手写的最左/最右触及区间公式，二维用手算解析例子与正三角形
+几何关系，并独立重算 KKT 证书条件（凸性 ⇒ 充分必要）；零半径退化
+情形与三维精确 Fraction 求解器逐字段对照，而不是调用被测数值入口
+生成期望值。
 """
 
 from fractions import Fraction
@@ -18,6 +24,7 @@ from miniball3d import (
     NoFeasibleCandidateError,
     SearchBudgetExhaustedError,
     minimum_enclosing_sphere,
+    minimum_enclosing_ball,
 )
 
 F = Fraction
@@ -490,6 +497,452 @@ class TestResultDataclass(unittest.TestCase):
         self.assertTrue(math.isfinite(r.radius_float))
         # 浮点视图不改变精确字段
         self.assertIsInstance(r.radius_squared, Fraction)
+
+
+# ---------------------------------------------------------------------------
+# 输入球接口（minimum_enclosing_ball）
+# ---------------------------------------------------------------------------
+
+def _indep_dist(a, b):
+    return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(len(a))))
+
+
+def assert_valid_ball_certificate(test, res, raw_balls, tol_scale=1.0):
+    """独立核验：逐球约束、支撑紧贴、权重条件、法向平衡、最优性下界。
+
+    所有量在测试内重算，不调用求解器产生期望值。
+    """
+    c, R = res.center, res.radius
+    eps = res.tol * 100 * max(1.0, R, tol_scale)
+
+    # 1) 逐球独立约束：dist(c,p_i) + a_i <= R（每个输入球单独一个谓词）
+    for (p, a) in raw_balls:
+        test.assertLessEqual(_indep_dist(c, p) + a, R + eps)
+    test.assertLessEqual(res.max_violation(), eps)
+    # constraint_values 与独立重算一致
+    for value, (p, a) in zip(res.constraint_values, raw_balls):
+        test.assertAlmostEqual(value, _indep_dist(c, p) + a, places=12)
+    # slack + value == R
+    for slack, value in zip(res.slacks, res.constraint_values):
+        test.assertAlmostEqual(slack + value, R, places=12)
+
+    # 2) 每个支撑球紧贴：dist + a == R
+    support_keys = set()
+    for s in res.support:
+        test.assertGreaterEqual(s.weight, -eps)
+        test.assertAlmostEqual(
+            _indep_dist(c, s.center) + s.radius, R, places=9
+        )
+        support_keys.add((tuple(s.center), s.radius, s.ids))
+
+    # 3) 权重：凸组合（和为 1、非负）
+    weights = res.weights
+    test.assertEqual(len(weights), len(res.support))
+    for w in weights:
+        test.assertGreaterEqual(w, -eps)
+    test.assertAlmostEqual(sum(weights), 1.0, places=10)
+
+    # 4) 法向平衡 Σ λ n = 0（dist=0 的退化单支撑除外，已在 API 侧处理）
+    for component in res.balance_residual():
+        test.assertLess(abs(component), math.sqrt(res.tol) * 10)
+
+    # 5) 最优性充分条件（凸性 ⇒ 必要）：沿任意方向小位移都会让某支撑越界。
+    #    用数值方向探针独立验证：R 不超过 c 邻域内能达到的最小上界，
+    #    即对 24 个试探方向 h，max_i(dist(c+δh,p_i)+a_i) >= R - eps。
+    dim = len(c)
+    directions = [(1.0,), (-1.0,)] if dim == 1 else [
+        (math.cos(2 * math.pi * j / 24), math.sin(2 * math.pi * j / 24))
+        for j in range(24)
+    ]
+    delta = 1e-5 * max(1.0, R)
+    for h in directions:
+        probe = tuple(c[d] + delta * h[d] for d in range(dim))
+        need = max(_indep_dist(probe, p) + a for p, a in raw_balls)
+        test.assertGreaterEqual(need, R - eps * 10)
+
+
+class TestEnclosingBallsKnownCases(unittest.TestCase):
+    def test_single_ball(self):
+        r = minimum_enclosing_ball([((2.0, -1.0), 0.75)])
+        self.assertEqual(r.center, (2.0, -1.0))
+        self.assertEqual(r.radius, 0.75)
+        self.assertEqual(len(r.support), 1)
+        self.assertEqual(r.weights, (1.0,))
+        self.assertEqual(r.num_input_balls, 1)
+
+    def test_single_point_zero_radius(self):
+        r = minimum_enclosing_ball([((3.0, 1.0), 0.0)])
+        self.assertEqual(r.radius, 0.0)
+        self.assertEqual(r.center, (3.0, 1.0))
+
+    def test_two_points_midpoint(self):
+        r = minimum_enclosing_ball([((0.0, 0.0), 0.0), ((4.0, 0.0), 0.0)])
+        self.assertEqual(r.center, (2.0, 0.0))
+        self.assertEqual(r.radius, 2.0)
+        self.assertEqual(r.weights, (0.5, 0.5))
+        assert_valid_ball_certificate(self, r, [((0.0, 0.0), 0.0), ((4.0, 0.0), 0.0)])
+
+    def test_two_unequal_balls_analytic(self):
+        # 心 0 与 10、半径 1 与 3：R=(d+a+b)/2=7，c=p0+(R-a0)=6
+        r = minimum_enclosing_ball(
+            [((0.0,), 1.0), ((10.0,), 3.0)], dim=1
+        )
+        self.assertAlmostEqual(r.radius, 7.0, places=12)
+        self.assertAlmostEqual(r.center[0], 6.0, places=12)
+        assert_valid_ball_certificate(
+            self, r, [((0.0,), 1.0), ((10.0,), 3.0)]
+        )
+
+    def test_two_balls_2d_analytic(self):
+        # 心 (0,0)、(6,8)（距离 10），半径 1、3：R=7，c=p0+(R-1)u=(3.6,4.8)
+        r = minimum_enclosing_ball(
+            [((0.0, 0.0), 1.0), ((6.0, 8.0), 3.0)]
+        )
+        self.assertAlmostEqual(r.radius, 7.0, places=12)
+        self.assertAlmostEqual(r.center[0], 3.6, places=12)
+        self.assertAlmostEqual(r.center[1], 4.8, places=12)
+        self.assertEqual(len(r.support), 2)
+
+    def test_nested_ball_single_support(self):
+        # 大球完全覆盖小球：d+a <= R0 ⇔ 3+1 <= 5
+        r = minimum_enclosing_ball([((0.0,), 5.0), ((3.0,), 1.0)], dim=1)
+        self.assertEqual(r.center, (0.0,))
+        self.assertEqual(r.radius, 5.0)
+        self.assertEqual(len(r.support), 1)
+        self.assertEqual(r.support[0].radius, 5.0)
+        # 被包含球的 slack：R - (d + a) = 5 - 4 = 1 ≥ 0
+        self.assertGreaterEqual(r.slacks[1], 1.0 - 1e-12)
+        self.assertLessEqual(r.slacks[1], 1.0 + 1e-12)
+
+    def test_concentric_balls(self):
+        r = minimum_enclosing_ball(
+            [((1.0, 1.0), 3.0), ((1.0, 1.0), 1.0)], ids=("big", "small")
+        )
+        self.assertEqual(r.radius, 3.0)
+        self.assertEqual(r.support[0].ids, ("big",))
+        self.assertAlmostEqual(r.slacks[1], 2.0, places=12)
+
+    def test_equilateral_points_three_support(self):
+        # 边长 4 的正三角形顶点：外心 (2, 2/√3)，R = 4/√3
+        h = 2.0 * math.sqrt(3.0)
+        pts = [((0.0, 0.0), 0.0), ((4.0, 0.0), 0.0), ((2.0, h), 0.0)]
+        r = minimum_enclosing_ball(pts)
+        self.assertAlmostEqual(r.center[0], 2.0, places=12)
+        self.assertAlmostEqual(r.center[1], 2.0 / math.sqrt(3.0), places=12)
+        self.assertAlmostEqual(r.radius, 4.0 / math.sqrt(3.0), places=12)
+        self.assertEqual(len(r.support), 3)
+        for w in r.weights:
+            self.assertAlmostEqual(w, 1.0 / 3.0, places=10)
+        assert_valid_ball_certificate(self, r, pts)
+
+    def test_three_equal_balls(self):
+        # 三个半径 1 的球心在正三角形顶点：R = 4/√3 + 1
+        h = 2.0 * math.sqrt(3.0)
+        balls = [((0.0, 0.0), 1.0), ((4.0, 0.0), 1.0), ((2.0, h), 1.0)]
+        r = minimum_enclosing_ball(balls)
+        self.assertAlmostEqual(r.radius, 4.0 / math.sqrt(3.0) + 1.0, places=12)
+        self.assertAlmostEqual(r.center[1], 2.0 / math.sqrt(3.0), places=12)
+        assert_valid_ball_certificate(self, r, balls)
+
+    def test_three_unequal_balls_constructed_solution(self):
+        # 解析构造：c*=0, R*=10，三条法向相隔 120° 时 Σn=0。
+        #   n1=(1,0),      d1=8, a1=2  -> p1=(-8,0)
+        #   n2=(-1/2,√3/2),d2=5, a2=5  -> p2=(5/2,-5√3/2)
+        #   n3=(-1/2,-√3/2),d3=6,a3=4  -> p3=(3,3√3)
+        balls = [
+            ((-8.0, 0.0), 2.0),
+            ((2.5, -5.0 * math.sqrt(3.0) / 2.0), 5.0),
+            ((3.0, 3.0 * math.sqrt(3.0)), 4.0),
+        ]
+        r = minimum_enclosing_ball(balls)
+        self.assertAlmostEqual(r.radius, 10.0, places=9)
+        self.assertAlmostEqual(r.center[0], 0.0, places=8)
+        self.assertAlmostEqual(r.center[1], 0.0, places=8)
+        self.assertEqual(len(r.support), 3)
+        for w in r.weights:
+            self.assertAlmostEqual(w, 1.0 / 3.0, places=8)
+        assert_valid_ball_certificate(self, r, balls, tol_scale=10.0)
+
+    def test_obtuse_triangle_degrades_to_two_support(self):
+        balls = [((0.0, 0.0), 0.0), ((4.0, 0.0), 0.0), ((1.0, 1.0), 0.0)]
+        r = minimum_enclosing_ball(balls)
+        self.assertEqual(len(r.support), 2)
+        self.assertEqual(r.center, (2.0, 0.0))
+        self.assertEqual(r.radius, 2.0)
+        # 第三点严格在内部：dist((2,0),(1,1))=√2 < 2
+        self.assertGreater(r.slacks[2], 0.5)
+
+    def test_collinear_2d_uses_two_support(self):
+        balls = [
+            ((0.0, 0.0), 0.0), ((2.0, 0.0), 0.0), ((5.0, 0.0), 0.0)
+        ]
+        r = minimum_enclosing_ball(balls)
+        self.assertEqual(len(r.support), 2)
+        self.assertAlmostEqual(r.center[0], 2.5, places=12)
+        self.assertAlmostEqual(r.radius, 2.5, places=12)
+
+    def test_1d_extremes(self):
+        # 独立期望：触及区间 [p-a, p+a] 的并集，c=(L+U)/2, R=(U-L)/2
+        raw = [(-3.0, 0.5), (0.0, 1.0), (5.0, 2.0)]
+        left = min(p - a for p, a in raw)   # -3.5
+        right = max(p + a for p, a in raw)  # 7.0
+        balls = [(((p,), a)) for p, a in raw]
+        r = minimum_enclosing_ball(balls, dim=1)
+        self.assertAlmostEqual(r.center[0], (left + right) / 2, places=12)
+        self.assertAlmostEqual(r.radius, (right - left) / 2, places=12)
+        assert_valid_ball_certificate(self, r, balls)
+
+    def test_1d_integer_points(self):
+        balls = [((float(i),), 0.0) for i in range(6)]
+        r = minimum_enclosing_ball(balls, dim=1)
+        self.assertAlmostEqual(r.center[0], 2.5, places=12)
+        self.assertAlmostEqual(r.radius, 2.5, places=12)
+        self.assertEqual(len(r.support), 2)
+
+    def test_six_balls_boundary_count(self):
+        # 6 个输入球（接口上限）：正六边形顶点，半径各异
+        balls = []
+        for j in range(6):
+            ang = 2 * math.pi * j / 6
+            balls.append(((math.cos(ang), math.sin(ang)), 0.1 * (j + 1)))
+        r = minimum_enclosing_ball(balls)
+        self.assertEqual(r.num_input_balls, 6)
+        assert_valid_ball_certificate(self, r, balls)
+
+    def test_duplicate_balls_merge_ids(self):
+        r = minimum_enclosing_ball(
+            [((0.0, 0.0), 1.0), ((0.0, 0.0), 1.0), ((3.0, 0.0), 0.0)],
+            ids=("a", "b", "c"),
+        )
+        self.assertEqual(r.num_input_balls, 3)
+        sup = {s.ids: s for s in r.support}
+        self.assertIn(("a", "b"), sup)
+
+    def test_integer_and_fraction_inputs(self):
+        # int 与 Fraction 都按精确值转 float：球 (1/3,0) r=1/2 与 (1,0) 点
+        r = minimum_enclosing_ball(
+            [((F(1, 3), 0), F(1, 2)), ((1, 0), 0)]
+        )
+        # 两心距 2/3；R=(d+a+b)/2=(2/3+1/2)/2=7/12
+        # c = p0 + (R-a)·u，u 为 p0→p1 单位方向 (1,0)，故 c_x=1/3+1/12=5/12
+        self.assertAlmostEqual(r.radius, F(7, 12), places=12)
+        expected_c = F(1, 3) + (F(7, 12) - F(1, 2))
+        self.assertAlmostEqual(r.center[0], float(expected_c), places=12)
+
+
+class TestEnclosingBallsDegenerateToPoints(unittest.TestCase):
+    """零半径输入必须与点集最小包围球一致（与精确 Fraction 求解器对照）。"""
+
+    def _cross_check_3d_embedding(self, points3):
+        # 三维精确结果投影到二维（点集都在 z=0 平面）
+        exact = minimum_enclosing_sphere(points3)
+        balls = [((float(p[0]), float(p[1])), 0.0) for p in points3]
+        r = minimum_enclosing_ball(balls)
+        self.assertAlmostEqual(
+            r.radius, math.sqrt(float(exact.radius_squared)), places=8
+        )
+        self.assertAlmostEqual(r.center[0], float(exact.center[0]), places=8)
+        self.assertAlmostEqual(r.center[1], float(exact.center[1]), places=8)
+        # 支撑数一致
+        self.assertEqual(len(r.support), len(exact.support))
+        assert_valid_ball_certificate(self, r, balls)
+
+    def test_square_matches_exact_solver(self):
+        pts = [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)]
+        self._cross_check_3d_embedding(pts)
+
+    def test_acute_triangle_matches_exact_solver(self):
+        pts = [(0, 0, 0), (2, 0, 0), (1, 3, 0)]
+        self._cross_check_3d_embedding(pts)
+
+    def test_random_sets_match_exact_solver(self):
+        rng = random.Random(20260924)
+        for trial in range(40):
+            n = rng.randint(1, 6)
+            pts = [
+                (rng.randint(-5, 5), rng.randint(-5, 5), 0)
+                for _ in range(n)
+            ]
+            with self.subTest(trial=trial, n=n):
+                self._cross_check_3d_embedding(pts)
+
+    def test_1d_matches_exact_solver(self):
+        # 一维沿 x 轴的点与三维精确结果对照
+        pts3 = [(-4, 0, 0), (1, 0, 0), (3, 0, 0)]
+        exact = minimum_enclosing_sphere(pts3)
+        r = minimum_enclosing_ball(
+            [((float(p[0]),), 0.0) for p in pts3], dim=1
+        )
+        self.assertAlmostEqual(r.radius, math.sqrt(float(exact.radius_squared)), places=9)
+        self.assertAlmostEqual(r.center[0], float(exact.center[0]), places=9)
+
+
+class TestEnclosingBallsIndependentSweep(unittest.TestCase):
+    def test_1d_exhaustive_reference(self):
+        # 一维独立参考：触及区间并集（完全独立的代码路径，不调用求解器）
+        rng = random.Random(424242)
+        for trial in range(100):
+            n = rng.randint(1, 6)
+            balls = [
+                ((rng.uniform(-5, 5),), rng.uniform(0, 2))
+                for _ in range(n)
+            ]
+            left = min(p[0] - a for (p, a) in balls)
+            right = max(p[0] + a for (p, a) in balls)
+            r = minimum_enclosing_ball(balls, dim=1)
+            self.assertAlmostEqual(r.center[0], (left + right) / 2, places=8)
+            self.assertAlmostEqual(r.radius, (right - left) / 2, places=8)
+            assert_valid_ball_certificate(self, r, balls)
+
+    def test_2d_grid_enumeration(self):
+        # 小规模枚举：球心取自整数网格、半径取离散集合，独立探针验证最优性
+        grid = [(x, y) for x in (-2, 0, 2) for y in (-2, 0, 2)]
+        radii = (0.0, 0.5, 1.0)
+        rng = random.Random(99)
+        for trial in range(60):
+            n = rng.randint(2, 5)
+            idxs = rng.sample(range(len(grid)), n)
+            balls = [
+                ((float(grid[i][0]), float(grid[i][1])), rng.choice(radii))
+                for i in idxs
+            ]
+            r = minimum_enclosing_ball(balls)
+            assert_valid_ball_certificate(self, r, balls)
+            # 独立全局网格下界：在细网格上枚举中心，R* 不得明显大于
+            # 网格找到的最小上界（网格分辨率 0.1，允许 0.05 误差）
+            best_grid = float("inf")
+            gx = [x / 10 for x in range(-30, 31)]
+            gy = [y / 10 for y in range(-30, 31)]
+            for x in gx:
+                for y in gy:
+                    need = max(
+                        math.hypot(x - p[0], y - p[1]) + a for p, a in balls
+                    )
+                    if need < best_grid:
+                        best_grid = need
+            self.assertLessEqual(r.radius, best_grid + 0.06)
+
+
+class TestEnclosingBallsValidation(unittest.TestCase):
+    def test_empty_rejected(self):
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball([])
+
+    def test_too_many_rejected(self):
+        balls = [((0.0, 0.0), 0.0)] * 7
+        with self.assertRaises(ValueError) as cm:
+            minimum_enclosing_ball(balls)
+        self.assertIn("at most 6", str(cm.exception))
+
+    def test_six_accepted(self):
+        balls = [((float(i), 0.0), 0.0) for i in range(6)]
+        r = minimum_enclosing_ball(balls)
+        self.assertEqual(r.num_input_balls, 6)
+
+    def test_negative_radius_locatable(self):
+        with self.assertRaises(ValueError) as cm:
+            minimum_enclosing_ball([((0.0, 0.0), -0.1)])
+        self.assertIn("balls[0]", str(cm.exception))
+
+    def test_nan_inf_rejected_locatable(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as cm:
+                    minimum_enclosing_ball([((0.0, bad), 0.0)])
+                self.assertIn("balls[0][0]", str(cm.exception))
+            with self.assertRaises(ValueError):
+                minimum_enclosing_ball([((0.0, 0.0), bad)])
+
+    def test_wrong_dimension(self):
+        with self.assertRaises(ValueError) as cm:
+            minimum_enclosing_ball([((1.0,), 0.0)], dim=2)
+        self.assertIn("balls[0]", str(cm.exception))
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball([((1.0, 2.0, 3.0), 0.0)], dim=2)
+        with self.assertRaises(ValueError) as cm:
+            minimum_enclosing_ball([((1.0, 2.0), 0.0)], dim=1)
+        self.assertIn("balls[0]", str(cm.exception))
+
+    def test_bad_pair_shape(self):
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball([((0.0, 0.0),)])  # 只有中心没有半径
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball([("x", 0.0)])
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball("ab")
+
+    def test_bool_rejected(self):
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball([((True, 0.0), 0.0)])
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball([((0.0, 0.0), True)])
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball([((0.0, 0.0), 0.0)], dim=True)
+
+    def test_dim_restrictions(self):
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball([((0.0, 0.0, 0.0), 0.0)], dim=3)
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball([((0.0,), 0.0)], dim=1.0)
+
+    def test_tol_validation(self):
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball([((0.0,), 0.0)], dim=1, tol=-1e-9)
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball([((0.0,), 0.0)], dim=1, tol=float("nan"))
+        with self.assertRaises(TypeError):
+            minimum_enclosing_ball([((0.0,), 0.0)], dim=1, tol="x")
+        # tol=0 合法：精确可表示的配置仍应通过
+        r = minimum_enclosing_ball(
+            [((0.0,), 0.0), ((2.0,), 0.0)], dim=1, tol=0.0
+        )
+        self.assertAlmostEqual(r.radius, 1.0)
+
+    def test_ids_semantics(self):
+        with self.assertRaises(ValueError):
+            minimum_enclosing_ball(
+                [((0.0,), 0.0), ((1.0,), 0.0)], dim=1, ids=[1]
+            )
+        with self.assertRaises(ValueError) as cm:
+            minimum_enclosing_ball(
+                [((0.0,), 0.0), ((1.0,), 0.0)], dim=1, ids=["x", "x"]
+            )
+        self.assertIn("ids[1]", str(cm.exception))
+
+    def test_input_not_mutated(self):
+        balls = [((0.0, 0.0), 1.0), ((3.0, 0.0), 0.5)]
+        ids = ["a", "b"]
+        minimum_enclosing_ball(balls, ids=ids)
+        self.assertEqual(balls, [((0.0, 0.0), 1.0), ((3.0, 0.0), 0.5)])
+        self.assertEqual(ids, ["a", "b"])
+
+    def test_frozen_result(self):
+        r = minimum_enclosing_ball([((0.0,), 1.0)], dim=1)
+        with self.assertRaises(Exception):
+            r.radius = 9.0
+
+    def test_contains_helpers(self):
+        r = minimum_enclosing_ball(
+            [((0.0, 0.0), 1.0), ((4.0, 0.0), 1.0)]
+        )
+        # R = 3, c = (2,0)；球面上的点算包含
+        self.assertTrue(r.contains_point((-1.0, 0.0)))
+        self.assertTrue(r.contains_point((5.0, 0.0)))
+        # (2,2) 距心 2 ≤ 3 在球内；(2,3.5) 距心 3.5 > 3 在球外
+        self.assertTrue(r.contains_point((2.0, 2.0)))
+        self.assertFalse(r.contains_point((2.0, 3.5)))
+        # 被包含的球：心 (2,0) r=1
+        self.assertTrue(r.contains_ball((2.0, 0.0), 1.0))
+        # 越界的球：心 (2,1.5) r=2，dist+2=3.5 > 3
+        self.assertFalse(r.contains_ball((2.0, 1.5), 2.0))
+
+    def test_balls_attribute_is_independent_copy(self):
+        raw = [((0.0, 0.0), 1.0)]
+        r = minimum_enclosing_ball(raw)
+        self.assertEqual(r.balls, (((0.0, 0.0), 1.0),))
+        # 修改原输入不影响结果内的存档
+        raw[0] = ((9.0, 9.0), 9.0)
+        self.assertEqual(r.balls, (((0.0, 0.0), 1.0),))
 
 
 if __name__ == "__main__":
