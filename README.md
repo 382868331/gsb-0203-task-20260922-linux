@@ -1,8 +1,10 @@
-# miniball3d — 三维有理点集最小包围球与最优证书
+# miniball3d — 三维有理点集最小包围球与最优证书（含 trimmed_ball）
 
 纯 Python 标准库实现：对最多 30 个有理三维点，用 **精确 `Fraction` 算术**
 求最小包围球（minimum enclosing ball），并输出可独立核验的最优性证书
-（支撑点 + 非负重心系数）。
+（支撑点 + 非负重心系数）。另提供 `trimmed_ball(points, k)`：允许排除
+最多 k 个（k ∈ 0..3）输入点后的最小包围球，仍是精确全局枚举，不是
+启发式离群点猜测，也不是统计置信球。
 
 - **Python 版本**：Python 3.14.7（CPython，Linux 原生验证）
 - **依赖**：无，仅标准库（`fractions`、`itertools`、`dataclasses`、`math`）；
@@ -13,12 +15,16 @@
 ## 运行命令
 
 ```bash
-# 必要测试（28 个用例）
+# 必要测试（44 个用例）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（正常结果 + 一个真实触发的拒绝边界；约 0.1 秒）
+# 固定输入演示（正常结果 + trimmed_ball + 真实触发的拒绝边界；约 0.1 秒）
 python demo.py
 ```
+
+以上命令在仓库根目录执行；题目环境解释器为 `./.venv/bin/python`
+（Python 3.14.7），即 `./.venv/bin/python -m unittest discover -s tests -v`
+与 `./.venv/bin/python demo.py`。全程离线、标准库、无凭据。
 
 ## 公开接口
 
@@ -49,6 +55,78 @@ result = minimum_enclosing_sphere(points, *, ids=None, budget=None)
 | `contains(p)` | 精确包含判定（边界算包含） |
 | `certificate_residual()` | `sum λ_i (c − p_i)`，证书下精确为 `(0,0,0)` |
 | `dual_identity_radius_squared()` | 对偶恒等式右侧，证书下精确等于 `radius_squared` |
+
+## trimmed_ball：允许排除最多 k 个点
+
+```python
+from miniball3d import trimmed_ball
+
+result = trimmed_ball(points, k, *, ids=None, budget=None)
+```
+
+- `k`：允许排除的最大点数，整数 0..3（`bool` 拒绝，越界
+  `ValueError`）。`k=0` 时 `result.ball` 与
+  `minimum_enclosing_sphere(points, ids=ids)` 完全一致。
+- 重复坐标的每个副本都是**独立观测**：排除子集按输入下标枚举，删一个
+  副本不会删除该位置的其他点。
+- 剩余集合不许为空（排除子集大小 ≤ n−1，自动收紧）。
+- **目标排序**：按 `(半径平方, 排除数量, 被排除 ID 序列)` 字典序取
+  最优——先半径最小，平局排除更少，再平局被排除 ID 序列（按输入顺序
+  排列）字典序更小；ID 不可互相比较时退化为输入下标序，结果仍确定。
+- **无启发式猜测**：枚举所有大小 ≤ min(k, n−1) 的排除子集，每个候选在
+  保留点上用与原接口相同的精确候选支撑 + 重心证书求解；候选结果列出
+  全部被排除的原始 ID。
+- `budget`：可选正整数，限制评估的排除子集数。耗尽时**不抛异常**，
+  返回 `complete=False` 的当前最优可行球（状态未完成，绝不冒充全局
+  最优）。
+
+返回 frozen dataclass `TrimmedBall`：
+
+| 字段/属性 | 含义 |
+|---|---|
+| `ball` | 保留点集上的 `MinimumEnclosingSphere`（含完整证书） |
+| `excluded_ids` | 被排除点的全部原始 ID（按输入顺序） |
+| `complete` | 全部子集枚举完毕为 True；预算耗尽为 False |
+| `candidates_examined` | 实际评估的排除子集数 |
+| `center` / `radius_squared` | 委托给 `ball` 的精确量 |
+
+### 可复现使用路径
+
+```bash
+# 1) 直接跑演示（约 0.1 秒，现场计算，含孤立点被排除的完整证书）
+./.venv/bin/python demo.py
+```
+
+```python
+# 2) 等价的最小可复现代码
+from miniball3d import trimmed_ball
+
+points = [(0, 0, 0), (2, 0, 0), (0, 2, 0), (2, 2, 0), (100, 0, 0)]
+result = trimmed_ball(points, 1, ids=["c0", "c1", "c2", "c3", "isolated"])
+assert result.complete
+assert result.excluded_ids == ("isolated",)
+assert result.radius_squared == 2          # 精确 Fraction
+assert result.ball.certificate_residual() == (0, 0, 0)
+```
+
+### 失败示例（真实触发，不静默纠正）
+
+```python
+trimmed_ball(points, 4)
+# ValueError: k: must be in 0..3, got 4
+
+trimmed_ball(points, 1, budget=1)
+# 不抛异常：返回 complete=False 的 TrimmedBall，
+# ball 只是当前最优可行球（excluded_ids == ()），结果未知不冒充最优。
+```
+
+### trimmed_ball 的复杂度与定位
+
+排除子集数为 Σ_{j=0..k} C(n, j)（n=30、k=3 时约 4.5 千），每个子集内部
+仍是 O(m⁴) 候选的精确枚举，因此 k=3 且 n 接近 30 时总耗时显著高于
+k=0；请用 `budget` 限制并以 `complete` 判断是否完成。这是“离线精确
+全局枚举 + 可验证证书”的取舍，**不是**统计置信球，接口也不接受任何
+带半径的输入球。
 
 ### 证书如何验证最优性
 
@@ -124,6 +202,8 @@ CPython 3.14.7 上 30 个随机整数点约 3–4 秒。该规模符合“离线
   近似几何谓词）。
 - 枚举复杂度 O(n⁴) 候选、每候选 O(n) Fraction 包含检查；n > 30 在接口
   层直接拒绝。
+- `trimmed_ball` 的 k 限定 0..3；排除子集枚举叠加上述内层枚举，
+  大 n 大 k 时慢，预算耗尽只回当前可行球 + `complete=False`。
 - Fraction 分子分母随坐标位宽增长，输入极大整数时运算会变慢（无位宽
   上限之外的额外保护）。
 - 浮点输入按其精确二进制值参与计算：例如 `0.1` 被当作
@@ -145,9 +225,17 @@ budget 耗尽/无解两类异常、不可变性。
 支撑集与重心系数，并对每个结果做精确证书核验（含对偶恒等式）。
 “往返一致”类检查仅作补充。
 
+`tests/test_trimmed_ball.py`（16 个用例）覆盖：k=0 与原接口逐字段一致、
+孤立点被排除、对称平局按被排除 ID 序列裁决、重复离群位置（k=1 删不掉
+两个副本、k=2 才能）、共线点、全部点相同、剩余集合不为空、预算耗尽
+返回当前可行球 + `complete=False`、原始 ID 透传、结果不可变、
+k/budget/点集的全部输入校验。
+
 ## 文件清单
 
 - `miniball3d.py` — 本题核心库（可直接 import）。
 - `tests/test_miniball3d.py` — 必要测试 + 独立参考实现。
-- `demo.py` — 固定输入演示（立方体 8 顶点；真实计算 + 真实拒绝边界）。
+- `tests/test_trimmed_ball.py` — trimmed_ball 必要测试。
+- `demo.py` — 固定输入演示（立方体 8 顶点 + trimmed_ball 孤立点排除；
+  真实计算 + 真实拒绝边界）。
 - `README.md`、`requirements.txt`（无第三方依赖）。

@@ -10,7 +10,7 @@
 
 from fractions import Fraction
 
-from miniball3d import minimum_enclosing_sphere
+from miniball3d import minimum_enclosing_sphere, trimmed_ball
 
 
 def build_deterministic_points():
@@ -81,6 +81,46 @@ def main():
         print("  -> 没有静默纠正；错误定位到具体参数路径 points[1][1]")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+
+    print()
+    print("=== trimmed_ball：允许排除最多 k 个离群点（精确全局枚举） ===")
+    # 4 个簇内点 + 1 个孤立点；k=1 时孤立点被排除。
+    tpoints = [(0, 0, 0), (2, 0, 0), (0, 2, 0), (2, 2, 0), (100, 0, 0)]
+    tids = ["c0", "c1", "c2", "c3", "isolated"]
+    tresult = trimmed_ball(tpoints, 1, ids=tids)
+    show("排除上限 k", 1)
+    show("搜索是否完成", tresult.complete)
+    show("被排除的原始 ID", str(tresult.excluded_ids))
+    show("精确中心 c", str(tresult.center))
+    show("精确半径平方 r^2", str(tresult.radius_squared))
+    print("保留点集上的支撑与重心证书：")
+    for s in tresult.ball.support:
+        print(f"  p={s.point}  来源ID={s.ids}  lambda={s.weight}")
+    kept = [p for p, i in zip(tpoints, tids) if i not in tresult.excluded_ids]
+    tchecks = [
+        ("重心系数非负且和为 1",
+         all(w >= 0 for w in tresult.ball.weights)
+         and sum(tresult.ball.weights, Fraction(0)) == 1),
+        ("平衡残差 = 0", tresult.ball.certificate_residual() == (0, 0, 0)),
+        ("保留点全部被包含", all(tresult.ball.contains(p) for p in kept)),
+        ("对偶恒等式成立",
+         tresult.ball.dual_identity_radius_squared() == tresult.radius_squared),
+    ]
+    print("证书核验：")
+    for name, ok in tchecks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    assert all(ok for _, ok in tchecks)
+    print("说明：这是精确的几何最小包围球（排除至多 k 个点后），")
+    print("不是统计置信球；接口也不接受任何带半径的输入球。")
+
+    print()
+    print("=== 边界：k 越界必须被拒绝且可定位 ===")
+    try:
+        trimmed_ball(tpoints, 4)
+    except ValueError as exc:
+        print(f"  实际捕获 ValueError: {exc}")
+    else:
+        raise AssertionError("k=4 应当被拒绝")
 
 
 if __name__ == "__main__":

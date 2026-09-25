@@ -5,6 +5,11 @@
 公开接口
 ========
     minimum_enclosing_sphere(points, *, ids=None, budget=None) -> MinimumEnclosingSphere
+    trimmed_ball(points, k, *, ids=None, budget=None) -> TrimmedBall
+        （允许排除最多 k 个点，k ∈ 0..3；目标按
+          (半径平方, 排除数量, 被排除 ID 序列) 字典序取最优；
+          重复坐标的每个副本是独立观测；预算耗尽返回
+          complete=False 的当前可行球，不冒充最优）
 
 核心思路（题面规定的枚举证书法）
 --------------------------------
@@ -35,16 +40,22 @@ from numbers import Rational
 
 __all__ = [
     "MIN_BALL_MAX_POINTS",
+    "TRIMMED_BALL_MAX_K",
     "SupportPoint",
     "MinimumEnclosingSphere",
+    "TrimmedBall",
     "MiniballError",
     "NoFeasibleCandidateError",
     "SearchBudgetExhaustedError",
     "minimum_enclosing_sphere",
+    "trimmed_ball",
 ]
 
 #: 接口允许的输入点数量上限（题面规定 30）。
 MIN_BALL_MAX_POINTS = 30
+
+#: trimmed_ball 允许排除的点数上限（题面规定 k ∈ 0..3）。
+TRIMMED_BALL_MAX_K = 3
 
 
 class MiniballError(Exception):
@@ -336,7 +347,12 @@ def minimum_enclosing_sphere(points, *, ids=None, budget=None) -> MinimumEnclosi
     n = len(normalized)
     original_ids = _normalize_ids(ids, n)
     budget_value = _normalize_budget(budget)
+    return _solve(normalized, original_ids, budget_value)
 
+
+def _solve(normalized, original_ids, budget_value=None) -> MinimumEnclosingSphere:
+    """对已校验的精确坐标与原始 ID 求最小包围球（枚举 + 证书）。"""
+    n = len(normalized)
     # 坐标去重但保留全部原始 ID 来源；首次出现顺序保证枚举确定性。
     provenance: dict[tuple, list] = {}
     unique_points: list[tuple[Fraction, Fraction, Fraction]] = []
@@ -402,3 +418,137 @@ def _less(key, best):
     if key[1] != best[1]:
         return key[1] < best[1]
     return key[2] < best[2]
+
+
+# ---------------------------------------------------------------------------
+# trimmed_ball：允许排除最多 k 个离群点的最小包围球
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TrimmedBall:
+    """trimmed_ball 的结果。
+
+    Attributes:
+        ball: 保留点集上的最小包围球（MinimumEnclosingSphere，含证书；
+            其 support 的 ids 只含未被排除的原始 ID）。
+        excluded_ids: 被排除点的全部原始 ID（按输入顺序；长度即排除数量）。
+        complete: True 表示全部排除子集已枚举完毕，结果为全局最优；
+            False 表示搜索预算耗尽，ball 只是当前最优可行球，状态未完成。
+        candidates_examined: 实际评估过的排除子集数。
+    """
+
+    ball: MinimumEnclosingSphere
+    excluded_ids: tuple
+    complete: bool
+    candidates_examined: int
+
+    @property
+    def center(self):
+        """保留点集包围球的精确中心（委托给 ball）。"""
+        return self.ball.center
+
+    @property
+    def radius_squared(self) -> Fraction:
+        """保留点集包围球的精确半径平方（委托给 ball）。"""
+        return self.ball.radius_squared
+
+
+def _normalize_k(k) -> int:
+    _reject_bool(k, "k")
+    if not isinstance(k, int):
+        raise TypeError("k: int in 0..3 expected")
+    if not 0 <= k <= TRIMMED_BALL_MAX_K:
+        raise ValueError(f"k: must be in 0..{TRIMMED_BALL_MAX_K}, got {k}")
+    return k
+
+
+def _id_sequence_less(ids_a, ids_b, idx_a, idx_b) -> bool:
+    """比较两个被排除 ID 序列（按输入顺序排列）。
+
+    ID 可比较时按 ID 序列字典序；若 ID 类型不可互相比较，则退化为
+    输入下标序列字典序（仍然完全确定，不引入随机性）。
+    """
+    try:
+        if ids_a < ids_b:
+            return True
+        if ids_a > ids_b:
+            return False
+        return False
+    except TypeError:
+        return idx_a < idx_b
+
+
+def trimmed_ball(points, k, *, ids=None, budget=None) -> TrimmedBall:
+    """允许排除最多 k 个输入点的最小包围球（精确、全局枚举）。
+
+    对每个大小不超过 min(k, n-1) 的排除子集（按输入下标枚举，重复坐标
+    的每个副本都是独立观测，排除一个副本不会删除该位置的其他点），
+    在保留点上用与 minimum_enclosing_sphere 相同的精确候选支撑 +
+    重心证书方法求最小包围球。目标按
+    (半径平方, 排除数量, 被排除 ID 序列) 字典序取最优——即先让半径
+    最小，平局时排除更少，再平局时排除 ID 序列字典序更小。
+
+    不做任何启发式离群点猜测：每个候选都完整列出被排除的全部原始 ID，
+    最优性由保留点集上的重心证书保证（complete=True 时）。
+
+    Args:
+        points: 1..30 个点（同 minimum_enclosing_sphere）。
+        k: 允许排除的最大点数，整数 0..3；bool 拒绝。k=0 时结果与
+            minimum_enclosing_sphere(points, ids=ids) 完全一致。
+        ids: 可选原始 ID（同 minimum_enclosing_sphere）。
+        budget: 可选正整数，最多评估的排除子集数。耗尽时不抛异常，
+            而是返回 complete=False 的 TrimmedBall：ball 为当前最优
+            可行球，绝不冒充全局最优。
+
+    Returns:
+        TrimmedBall。剩余集合永不为空（排除子集大小 <= n-1）。
+
+    Raises:
+        TypeError / ValueError: 输入校验失败（含 k 越界），可定位。
+    """
+    k_value = _normalize_k(k)
+    normalized = _normalize_points(points)
+    n = len(normalized)
+    original_ids = _normalize_ids(ids, n)
+    budget_value = _normalize_budget(budget)
+
+    max_exclude = min(k_value, n - 1)  # 剩余集合不许为空
+    best = None  # (r2, num_excluded, excluded_ids, excluded_idx, ball)
+    examined = 0
+    complete = True
+    for size in range(0, max_exclude + 1):
+        for combo in combinations(range(n), size):
+            if budget_value is not None and examined >= budget_value:
+                complete = False
+                break
+            excluded_idx = tuple(combo)
+            excluded_ids = tuple(original_ids[i] for i in excluded_idx)
+            kept_points = [
+                normalized[i] for i in range(n) if i not in excluded_idx
+            ]
+            kept_ids = [
+                original_ids[i] for i in range(n) if i not in excluded_idx
+            ]
+            ball = _solve(kept_points, kept_ids)
+            examined += 1
+            key = (ball.radius_squared, size)
+            if best is None:
+                better = True
+            elif key != (best[0], best[1]):
+                better = key < (best[0], best[1])
+            else:
+                better = _id_sequence_less(
+                    excluded_ids, best[2], excluded_idx, best[3]
+                )
+            if better:
+                best = (ball.radius_squared, size, excluded_ids, excluded_idx, ball)
+        if not complete:
+            break
+
+    # best 一定非空：size=0 的子集至少被评估一次（budget >= 1）。
+    return TrimmedBall(
+        ball=best[4],
+        excluded_ids=best[2],
+        complete=complete,
+        candidates_examined=examined,
+    )
