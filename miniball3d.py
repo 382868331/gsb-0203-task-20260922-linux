@@ -5,6 +5,7 @@
 公开接口
 ========
     minimum_enclosing_sphere(points, *, ids=None, budget=None) -> MinimumEnclosingSphere
+    trimmed_ball(points, k, *, ids=None, budget=None) -> TrimmedBallResult
 
 核心思路（题面规定的枚举证书法）
 --------------------------------
@@ -20,6 +21,9 @@
    支撑点等距、其余点不越界。
 5. 在全部成立候选中取 r^2 最小者；平局先取支撑数更少、再取下标字典序，
    结果完全确定。
+6. trimmed_ball 枚举同一组候选支撑球，精确统计球外观测；球外数不超过
+   k 时就是一个可行的剩余集合最小球。这等价于枚举所有非空排除子集后
+   独立求球，重复坐标仍按不同观测处理。
 
 本模块无状态、不修改输入、不使用随机数或浮点容差：所有几何判定都是
 Fraction 精确比较。浮点仅用于展示（见 README“误差口径”）。
@@ -35,16 +39,22 @@ from numbers import Rational
 
 __all__ = [
     "MIN_BALL_MAX_POINTS",
+    "MAX_TRIMMED_EXCLUSIONS",
     "SupportPoint",
     "MinimumEnclosingSphere",
+    "TrimmedBallResult",
     "MiniballError",
     "NoFeasibleCandidateError",
     "SearchBudgetExhaustedError",
     "minimum_enclosing_sphere",
+    "trimmed_ball",
 ]
 
 #: 接口允许的输入点数量上限（题面规定 30）。
 MIN_BALL_MAX_POINTS = 30
+
+#: trimmed_ball 允许排除的观测点数量上限。
+MAX_TRIMMED_EXCLUSIONS = 3
 
 
 class MiniballError(Exception):
@@ -137,6 +147,48 @@ class MinimumEnclosingSphere:
         )
 
 
+@dataclass(frozen=True)
+class TrimmedBallResult:
+    """允许排除至多 k 个观测点后的全局搜索结果。
+
+    当 ``complete`` 为 False 时，``ball`` 只是当前已找到的可行球（可能为
+    None），绝不能解释成全局最优；``excluded_ids`` 也只对应当前球。
+    """
+
+    ball: MinimumEnclosingSphere | None
+    excluded_ids: tuple
+    excluded_indices: tuple[int, ...]
+    k: int
+    complete: bool
+    examined_candidates: int
+    total_candidates: int
+    budget: int | None
+
+    @property
+    def center(self):
+        if self.ball is None:
+            raise ValueError("search is incomplete and no feasible ball is available")
+        return self.ball.center
+
+    @property
+    def radius_squared(self) -> Fraction:
+        if self.ball is None:
+            raise ValueError("search is incomplete and no feasible ball is available")
+        return self.ball.radius_squared
+
+    @property
+    def support(self) -> tuple[SupportPoint, ...]:
+        if self.ball is None:
+            raise ValueError("search is incomplete and no feasible ball is available")
+        return self.ball.support
+
+    @property
+    def weights(self) -> tuple[Fraction, ...]:
+        if self.ball is None:
+            raise ValueError("search is incomplete and no feasible ball is available")
+        return self.ball.weights
+
+
 # ---------------------------------------------------------------------------
 # 输入校验
 # ---------------------------------------------------------------------------
@@ -221,6 +273,154 @@ def _normalize_budget(budget) -> int | None:
     if budget <= 0:
         raise ValueError(f"budget: must be a positive integer, got {budget}")
     return budget
+
+
+def _normalize_trim_k(k) -> int:
+    _reject_bool(k, "k")
+    if not isinstance(k, int):
+        raise TypeError("k: integer from 0 to 3 expected")
+    if not 0 <= k <= MAX_TRIMMED_EXCLUSIONS:
+        raise ValueError(
+            f"k: must be between 0 and {MAX_TRIMMED_EXCLUSIONS}, got {k}"
+        )
+    return k
+
+
+def _candidate_count(m: int) -> int:
+    return sum(
+        math.comb(m, size)
+        for size in range(1, min(4, m) + 1)
+    )
+
+
+def _prepare_inputs(points, ids):
+    normalized = _normalize_points(points)
+    n = len(normalized)
+    original_ids = _normalize_ids(ids, n)
+
+    provenance: dict[tuple, list] = {}
+    unique_points: list[tuple[Fraction, Fraction, Fraction]] = []
+    for pid, p in zip(original_ids, normalized):
+        if p not in provenance:
+            provenance[p] = []
+            unique_points.append(p)
+        provenance[p].append(pid)
+    return normalized, original_ids, provenance, unique_points
+
+
+def _make_result(unique_points, provenance, combo, center, r2, weights):
+    support = tuple(
+        SupportPoint(
+            point=unique_points[idx],
+            ids=tuple(provenance[unique_points[idx]]),
+            weight=weights[pos],
+        )
+        for pos, idx in enumerate(combo)
+    )
+    return MinimumEnclosingSphere(
+        center=center,
+        radius_squared=r2,
+        support=support,
+        num_input_points=sum(len(v) for v in provenance.values()),
+        num_unique_points=len(provenance),
+    )
+
+
+def _enumerate_miniball(unique_points, provenance, budget_value):
+    """枚举唯一坐标的候选球。返回 (best, examined, total)。"""
+    m = len(unique_points)
+    total = _candidate_count(m)
+    best = None
+    examined = 0
+    for support_size in range(1, min(4, m) + 1):
+        for combo in combinations(range(m), support_size):
+            if budget_value is not None and examined >= budget_value:
+                return best, examined, total
+            examined += 1
+            found = _candidate(unique_points, combo)
+            if found is None:
+                continue
+            center, r2, weights = found
+            if any(weight < 0 for weight in weights):
+                continue
+            if any(_dist2(q, center) > r2 for q in unique_points):
+                continue
+            key = (r2, support_size, combo)
+            if best is None or key < _best_key(best):
+                best = (center, r2, weights, combo, key)
+    return best, examined, total
+
+
+def _enumerate_trimmed(normalized, original_ids, unique_points, k, budget_value):
+    """枚举候选支撑球，并把球外的每个观测 ID 作为必排除点。
+
+    对任一固定剩余集合，其最小包围球必有 1..4 个支撑点；因此枚举所有
+    支撑球、精确统计球外观测，等价于枚举全部非空排除子集后独立求球。
+    """
+    m = len(unique_points)
+    total = _candidate_count(m)
+    best = None
+    examined = 0
+    for support_size in range(1, min(4, m) + 1):
+        for combo in combinations(range(m), support_size):
+            if budget_value is not None and examined >= budget_value:
+                return best, examined, total
+            examined += 1
+            found = _candidate(unique_points, combo)
+            if found is None:
+                continue
+            center, r2, weights = found
+            if any(weight < 0 for weight in weights):
+                continue
+            outside_indices = tuple(
+                index
+                for index, point in enumerate(normalized)
+                if _dist2(point, center) > r2
+            )
+            outside_ids = tuple(original_ids[index] for index in outside_indices)
+            if len(outside_indices) > k:
+                continue
+            key = (
+                r2,
+                len(outside_indices),
+                outside_ids,
+                outside_indices,
+                support_size,
+                combo,
+            )
+            candidate = (
+                center, r2, weights, combo, outside_indices, outside_ids, key
+            )
+            if best is None or _trimmed_candidate_preferred(candidate, best):
+                best = candidate
+    return best, examined, total
+
+
+def _trimmed_candidate_preferred(candidate, best):
+    if candidate[1] != best[1]:
+        return candidate[1] < best[1]
+    if len(candidate[4]) != len(best[4]):
+        return len(candidate[4]) < len(best[4])
+    if _id_tuple_less(candidate[5], best[5]):
+        return True
+    if _id_tuple_less(best[5], candidate[5]):
+        return False
+    return candidate[6][3:] < best[6][3:]
+
+
+def _id_tuple_less(left, right):
+    for left_value, right_value in zip(left, right):
+        if left_value == right_value:
+            continue
+        try:
+            return left_value < right_value
+        except TypeError:
+            return False
+    return len(left) < len(right)
+
+
+def _best_key(best):
+    return best[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -332,44 +532,17 @@ def minimum_enclosing_sphere(points, *, ids=None, budget=None) -> MinimumEnclosi
         SearchBudgetExhaustedError: budget 耗尽。
         NoFeasibleCandidateError: 穷举证明无可行候选（非空输入下不会发生）。
     """
-    normalized = _normalize_points(points)
-    n = len(normalized)
-    original_ids = _normalize_ids(ids, n)
+    normalized, original_ids, provenance, unique_points = _prepare_inputs(points, ids)
     budget_value = _normalize_budget(budget)
-
-    # 坐标去重但保留全部原始 ID 来源；首次出现顺序保证枚举确定性。
-    provenance: dict[tuple, list] = {}
-    unique_points: list[tuple[Fraction, Fraction, Fraction]] = []
-    for pid, p in zip(original_ids, normalized):
-        if p not in provenance:
-            provenance[p] = []
-            unique_points.append(p)
-        provenance[p].append(pid)
-
-    m = len(unique_points)
-    best = None  # (r2, k, combo, center, weights)
-    examined = 0
-    for k in range(1, min(4, m) + 1):
-        for combo in combinations(range(m), k):
-            examined += 1
-            if budget_value is not None and examined > budget_value:
-                raise SearchBudgetExhaustedError(
-                    f"search budget of {budget_value} candidate(s) exhausted "
-                    f"before enumeration completed; result is unknown "
-                    f"(examined {examined - 1}, unique points {m})"
-                )
-            found = _candidate(unique_points, combo)
-            if found is None:
-                continue
-            center, r2, weights = found
-            if any(w < 0 for w in weights):
-                continue  # 中心不在支撑凸包内，不构成最优证书
-            if any(_dist2(q, center) > r2 for q in unique_points):
-                continue  # 不能包围全部点
-            key = (r2, k, combo)
-            if best is None or _less(key, best):
-                best = (r2, k, combo, center, weights)
-
+    best, examined, total = _enumerate_miniball(
+        unique_points, provenance, budget_value
+    )
+    if examined < total and budget_value is not None:
+        raise SearchBudgetExhaustedError(
+            f"search budget of {budget_value} candidate(s) exhausted "
+            f"before enumeration completed; result is unknown "
+            f"(examined {examined}, of {total}, unique points {len(unique_points)})"
+        )
     if best is None:
         # 数学上不可达：单点子集 k=1 对任意非空点集至少有一个可行候选
         # （全部点重合时即为该点）。
@@ -377,28 +550,63 @@ def minimum_enclosing_sphere(points, *, ids=None, budget=None) -> MinimumEnclosi
             "exhaustive enumeration proved no feasible enclosing sphere exists"
         )
 
-    r2, _k, combo, center, weights = best
-    support = tuple(
-        SupportPoint(
-            point=unique_points[idx],
-            ids=tuple(provenance[unique_points[idx]]),
-            weight=weights[pos],
+    center, _r2, weights, combo, _key = best
+    return _make_result(unique_points, provenance, combo, center, _r2, weights)
+
+
+def trimmed_ball(points, k, *, ids=None, budget=None) -> TrimmedBallResult:
+    """求允许排除至多 k 个观测点的最优包围球。
+
+    目标字典序为：半径平方、实际排除数量、被排除原始 ID 序列。若不同
+    ID 类型之间不可比较，则用输入位置序列兜底；最后再用支撑规模和坐
+    标下标保证同一排除集合上的输出确定性。
+
+    budget 耗尽时不抛异常；返回 complete=False 和当前已证明可行的最佳
+    球。没有找到可行球时 ball/excluded_ids 为空值。
+    """
+    normalized, original_ids, provenance, unique_points = _prepare_inputs(points, ids)
+    k_value = _normalize_trim_k(k)
+    budget_value = _normalize_budget(budget)
+
+    best, examined, total = _enumerate_trimmed(
+        normalized, original_ids, unique_points, k_value, budget_value
+    )
+    complete = examined >= total
+    if best is None:
+        return TrimmedBallResult(
+            ball=None,
+            excluded_ids=(),
+            excluded_indices=(),
+            k=k_value,
+            complete=complete,
+            examined_candidates=examined,
+            total_candidates=total,
+            budget=budget_value,
         )
-        for pos, idx in enumerate(combo)
-    )
-    return MinimumEnclosingSphere(
-        center=center,
-        radius_squared=r2,
-        support=support,
-        num_input_points=n,
-        num_unique_points=m,
-    )
 
+    center, r2, weights, combo, outside_indices, _outside_ids, _key = best
+    excluded_set = set(outside_indices)
+    retained_provenance = {}
+    for idx, (point, pid) in enumerate(zip(normalized, original_ids)):
+        if idx in excluded_set:
+            continue
+        retained_provenance.setdefault(point, []).append(pid)
 
-def _less(key, best):
-    """比较 (r2, k, combo)；平局时支撑更少优先，再按下标字典序。"""
-    if key[0] != best[0]:
-        return key[0] < best[0]
-    if key[1] != best[1]:
-        return key[1] < best[1]
-    return key[2] < best[2]
+    ball = _make_result(
+        unique_points,
+        retained_provenance,
+        combo,
+        center,
+        r2,
+        weights,
+    )
+    return TrimmedBallResult(
+        ball=ball,
+        excluded_ids=tuple(original_ids[idx] for idx in outside_indices),
+        excluded_indices=outside_indices,
+        k=k_value,
+        complete=complete,
+        examined_candidates=examined,
+        total_candidates=total,
+        budget=budget_value,
+    )

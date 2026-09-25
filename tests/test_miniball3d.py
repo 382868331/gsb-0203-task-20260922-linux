@@ -17,7 +17,9 @@ from miniball3d import (
     MinimumEnclosingSphere,
     NoFeasibleCandidateError,
     SearchBudgetExhaustedError,
+    TrimmedBallResult,
     minimum_enclosing_sphere,
+    trimmed_ball,
 )
 
 F = Fraction
@@ -175,6 +177,37 @@ def reference_miniball(points):
     assert best is not None
     _, c, r2, w, combo = best
     return c, r2, w, tuple(uniq[i] for i in combo), uniq
+
+
+def reference_trimmed_ball(points, k):
+    """独立枚举所有非空排除子集，并对每个剩余集合调用参考最小球。"""
+    n = len(points)
+    best = None
+    for count in range(min(k, n - 1) + 1):
+        for excluded in combinations(range(n), count):
+            excluded_set = set(excluded)
+            retained = [p for i, p in enumerate(points) if i not in excluded_set]
+            c, r2, weights, support_points, _ = reference_miniball(retained)
+            key = (r2, count, excluded, len(support_points), support_points)
+            if best is None or key < best[0]:
+                best = (key, c, r2, weights, support_points, excluded)
+    return best[1:]
+
+
+def reference_trimmed_ball(points, k):
+    """独立枚举所有非空排除子集，并对每个剩余集合调用参考最小球。"""
+    n = len(points)
+    best = None
+    for count in range(min(k, n - 1) + 1):
+        for excluded in combinations(range(n), count):
+            excluded_set = set(excluded)
+            retained = [p for i, p in enumerate(points) if i not in excluded_set]
+            c, r2, weights, support_points, _ = reference_miniball(retained)
+            support_count = len(support_points)
+            key = (r2, count, excluded, support_count, support_points)
+            if best is None or key < best[0]:
+                best = (key, c, r2, weights, support_points, excluded)
+    return best[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +404,143 @@ class TestCrossCheckIndependentReference(unittest.TestCase):
             (F(-2, 5), F(3, 4), F(1, 9)),
         ]
         self._cross_check(pts)
+
+
+class TestTrimmedBall(unittest.TestCase):
+    def assert_trimmed_certificate(self, result, points):
+        self.assertIsInstance(result, TrimmedBallResult)
+        self.assertIsNotNone(result.ball)
+        ball = result.ball
+        excluded = set(result.excluded_indices)
+        retained = [p for i, p in enumerate(points) if i not in excluded]
+        self.assertEqual(len(result.excluded_ids), len(result.excluded_indices))
+        self.assertEqual(ball.num_input_points, len(retained))
+        self.assertGreaterEqual(ball.num_input_points, 1)
+        for i, point in enumerate(points):
+            distance = sum((F(point[d]) - ball.center[d]) ** 2 for d in range(3))
+            if i in excluded:
+                self.assertGreater(distance, ball.radius_squared)
+            else:
+                self.assertLessEqual(distance, ball.radius_squared)
+        self.assertEqual(ball.certificate_residual(), (F(0), F(0), F(0)))
+        self.assertEqual(sum(ball.weights, F(0)), 1)
+        self.assertTrue(all(weight >= 0 for weight in ball.weights))
+        self.assertEqual(ball.dual_identity_radius_squared(), ball.radius_squared)
+
+    def assert_matches_reference(self, points, k):
+        result = trimmed_ball(points, k)
+        c, r2, weights, support_points, excluded = reference_trimmed_ball(points, k)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.center, c)
+        self.assertEqual(result.radius_squared, r2)
+        self.assertEqual(result.weights, weights)
+        self.assertEqual(tuple(s.point for s in result.support), support_points)
+        self.assertEqual(result.excluded_indices, excluded)
+        self.assert_trimmed_certificate(result, points)
+
+    def test_k0_matches_original_interface(self):
+        points = [(0, 0, 0), (4, 0, 0), (1, 1, 0)]
+        old = minimum_enclosing_sphere(points)
+        result = trimmed_ball(points, 0)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.excluded_ids, ())
+        self.assertEqual(result.excluded_indices, ())
+        self.assertEqual(result.ball, old)
+
+    def test_isolated_point_excluded_with_certificate(self):
+        points = [(-1, 0, 0), (0, 0, 0), (2, 0, 0), (0, 2, 0), (0, -2, 0), (10, 0, 0)]
+        result = trimmed_ball(points, 1, ids=["a", "b", "c", "d", "e", "outlier"])
+        self.assertEqual(result.excluded_ids, ("outlier",))
+        self.assertEqual(result.excluded_indices, (5,))
+        self.assertEqual(result.center, (0, 0, 0))
+        self.assertEqual(result.radius_squared, 4)
+        self.assertEqual(result.ball.num_input_points, 5)
+        self.assert_trimmed_certificate(result, points)
+
+    def test_symmetric_tie_uses_excluded_id_sequence(self):
+        points = [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)]
+        result = trimmed_ball(points, 2)
+        self.assertEqual(result.excluded_indices, (0, 1))
+        self.assertEqual(result.excluded_ids, (0, 1))
+        self.assertEqual(result.center, (1, 2, 0))
+        self.assertEqual(result.radius_squared, 1)
+        self.assertEqual(tuple(s.ids for s in result.support), ((2,), (3,)))
+
+    def test_custom_ids_can_reverse_symmetric_tie(self):
+        points = [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)]
+        result = trimmed_ball(points, 2, ids=["b", "d", "a", "c"])
+        self.assertEqual(result.excluded_ids, ("a", "c"))
+        self.assertEqual(result.excluded_indices, (2, 3))
+        self.assertEqual(tuple(s.ids for s in result.support), (("b",), ("d",)))
+
+    def test_duplicate_outlier_coordinates_are_distinct_observations(self):
+        points = [(0, 0, 0), (2, 0, 0), (1, 1, 0), (10, 0, 0), (10, 0, 0)]
+        one = trimmed_ball(points, 1)
+        self.assertEqual(one.excluded_indices, (0,))
+        self.assertEqual(one.radius_squared, F(41, 2))
+        two = trimmed_ball(points, 2)
+        self.assertEqual(two.excluded_indices, (3, 4))
+        self.assertEqual(two.radius_squared, 1)
+        self.assertEqual(tuple(two.support[0].ids), (0,))
+        three = trimmed_ball(points, 3)
+        self.assertEqual(three.excluded_indices, (0, 1, 2))
+        self.assertEqual(three.radius_squared, 0)
+        self.assertEqual(tuple(three.support[0].ids), (3, 4))
+
+    def test_collinear_points(self):
+        points = [(-10, 0, 0), (0, 0, 0), (1, 0, 0), (2, 0, 0)]
+        result = trimmed_ball(points, 1)
+        self.assertEqual(result.excluded_indices, (0,))
+        self.assertEqual(result.center, (1, 0, 0))
+        self.assertEqual(result.radius_squared, 1)
+        self.assert_trimmed_certificate(result, points)
+
+    def test_all_points_same_never_needs_exclusions(self):
+        points = [(7, 7, 7)] * 4
+        for k in range(4):
+            with self.subTest(k=k):
+                result = trimmed_ball(points, k)
+                self.assertTrue(result.complete)
+                self.assertEqual(result.excluded_indices, ())
+                self.assertEqual(result.radius_squared, 0)
+                self.assertEqual(result.ball.num_input_points, 4)
+                self.assertEqual(result.ball.num_unique_points, 1)
+                self.assertEqual(result.support[0].ids, (0, 1, 2, 3))
+
+    def test_small_sets_enumerate_exclusion_subsets_reference(self):
+        fixed_sets = [
+            [(0, 0, 0), (6, 0, 0), (3, 1, 0)],
+            [(0, 0, 0), (2, 0, 0), (1, 1, 0), (10, 0, 0), (10, 0, 0)],
+            [(-4, 0, 0), (-1, 0, 0), (0, 0, 0), (1, 0, 0), (4, 0, 0)],
+            [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (9, 9, 9)],
+        ]
+        rng = random.Random(20260925)
+        for _ in range(20):
+            n = rng.randint(1, 8)
+            fixed_sets.append([
+                (rng.randint(-4, 4), rng.randint(-4, 4), rng.randint(-4, 4))
+                for _ in range(n)
+            ])
+        for points in fixed_sets:
+            for k in range(min(3, len(points) - 1) + 1):
+                with self.subTest(points=points, k=k):
+                    self.assert_matches_reference(points, k)
+
+    def test_budget_exhausted_returns_feasible_but_incomplete(self):
+        points = [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)]
+        result = trimmed_ball(points, 3, budget=1)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.examined_candidates, 1)
+        self.assertEqual(result.total_candidates, 15)
+        self.assertIsNotNone(result.ball)
+        self.assertEqual(result.radius_squared, 0)
+        self.assertEqual(result.excluded_indices, (1, 2, 3))
+        self.assert_trimmed_certificate(result, points)
+
+    def test_k_validation(self):
+        for bad_k in (-1, 4, True, 1.5, "1"):
+            with self.assertRaises((TypeError, ValueError)):
+                trimmed_ball([(0, 0, 0)], bad_k)
 
 
 class TestInputValidation(unittest.TestCase):

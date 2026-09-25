@@ -13,11 +13,11 @@
 ## 运行命令
 
 ```bash
-# 必要测试（28 个用例）
-python -m unittest discover -s tests -v
+# 必要测试（新旧用例）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（正常结果 + 一个真实触发的拒绝边界；约 0.1 秒）
-python demo.py
+# 固定输入演示（正常结果、trimmed 证书和真实失败状态；约 0.1 秒）
+./.venv/bin/python demo.py
 ```
 
 ## 公开接口
@@ -26,6 +26,14 @@ python demo.py
 from miniball3d import minimum_enclosing_sphere
 
 result = minimum_enclosing_sphere(points, *, ids=None, budget=None)
+```
+
+允许排除最多 k 个观测点时：
+
+```python
+from miniball3d import trimmed_ball
+
+result = trimmed_ball(points, k, ids=None, budget=None)  # k 为 0..3 的整数
 ```
 
 - `points`：1..30 个点的有限序列；每个点是长度恰为 3 的序列。
@@ -64,6 +72,37 @@ result = minimum_enclosing_sphere(points, *, ids=None, budget=None)
 
 这些条件合在一起是最小包围球的标准充要条件（Welzl/凸分析证书）。
 
+### trimmed_ball 的返回与排序
+
+trimmed_ball 返回 TrimmedBallResult：
+
+| 字段/属性 | 含义 |
+|---|---|
+| ball | 当前可行的 MinimumEnclosingSphere；未完成且尚无可行球时为 None |
+| excluded_ids / excluded_indices | 当前球外、即被排除的全部原 ID 与输入位置 |
+| k | 调用方允许的最大排除数；实际排除数可能小于它 |
+| complete | 是否枚举完全部候选；只有 True 才代表全局最优 |
+| examined_candidates / total_candidates | 已检查 / 总候选数 |
+| budget | 本次候选检查预算；None 表示不限 |
+
+完整搜索的目标按以下字典序确定：
+
+1. radius_squared 更小；
+2. 实际排除数量更少；
+3. 被排除原 ID 序列字典序更小；若自定义 ID 类型之间不可比较，则按对应
+   输入位置序列保持确定性；
+4. 同一排除集合仍平局时，再按支撑规模和坐标下标确定唯一输出。
+
+重复坐标始终是不同观测：同一坐标的多个 ID 分别列在 excluded_ids 中；
+删除一个副本不会自动删除该位置的其他副本。剩余集合至少保留一个观测，
+因此不会返回空集合。trimmed_ball(points, 0) 的完整几何结果与
+minimum_enclosing_sphere(points) 一致，且仍返回 TrimmedBallResult 包装。
+
+这不是统计置信球、鲁棒估计置信区间或概率异常检测；输出只证明：在允许
+排除至多 k 个给定观测的离散组合问题中，该几何半径按上述排序最优。本模
+块也不接受带半径的输入球作为候选，候选中心仍只由剩余点的 1..4 个仿射
+独立支撑点精确确定。
+
 ## 算法与设计取舍
 
 1. **去重保留来源**：按精确坐标去重（首次出现序），重复坐标的所有原始
@@ -82,6 +121,14 @@ result = minimum_enclosing_sphere(points, *, ids=None, budget=None)
    掩盖边界情形（钝角三角形自动退化为最长边直径、直角三角形同样退化、
    重合点退化为半径 0）。
 7. **无状态、不修改输入**；主函数是纯函数。
+8. **允许少量排除**：对每个候选支撑球精确列出所有球外观测 ID；球外观测
+   数不超过 k 时构成可行 trimmed ball。由于任意剩余集合的最小包围球都
+   必有 1..4 个支撑点，枚举这些支撑球等价于枚举全部非空排除子集后独立
+   求最小球，不需要也不允许先用启发式猜测离群点。
+9. **预算失败语义**：trimmed_ball(..., budget=B) 在预算耗尽时返回
+   complete=False、当前可行球以及检查进度；不会把当前球冒充为全局最优。
+   原 minimum_enclosing_sphere 的预算语义保持为抛出
+   SearchBudgetExhaustedError。
 
 ### 枚举规模（输入上限 30 的依据）
 
@@ -100,10 +147,11 @@ CPython 3.14.7 上 30 个随机整数点约 3–4 秒。该规模符合“离线
 - `ids` 长度不符 → `ValueError`；重复 ID → `ValueError`（如 `ids[1]`）；
   不可哈希 → `TypeError`。
 - `budget` 非正整数 → `ValueError`/`TypeError`。
-- **搜索预算耗尽与证明无解严格分开**：
-  `SearchBudgetExhaustedError`（结果未知，绝不冒充最优或无解）
-  ≠ `NoFeasibleCandidateError`（穷举证明不可行；非空输入下数学上不会
-  发生，保留用于契约完整性）。
+- **搜索预算耗尽与证明无解严格分开**：minimum_enclosing_sphere 抛
+  SearchBudgetExhaustedError（结果未知，绝不冒充最优或无解），不同于
+  NoFeasibleCandidateError（穷举证明不可行；非空输入下数学上不会发生，
+  保留用于契约完整性）；trimmed_ball 则返回 complete=False、当前可行球
+  与未完成进度。
 - 本模块没有多步批次/可变异状态，不存在部分变更问题；输入对象不会被
   修改。
 
@@ -124,6 +172,8 @@ CPython 3.14.7 上 30 个随机整数点约 3–4 秒。该规模符合“离线
   近似几何谓词）。
 - 枚举复杂度 O(n⁴) 候选、每候选 O(n) Fraction 包含检查；n > 30 在接口
   层直接拒绝。
+- trimmed_ball 仅支持 k in 0..3；这是离散几何修剪问题，不给出统计分
+  布、置信水平或异常概率。
 - Fraction 分子分母随坐标位宽增长，输入极大整数时运算会变慢（无位宽
   上限之外的额外保护）。
 - 浮点输入按其精确二进制值参与计算：例如 `0.1` 被当作
@@ -132,7 +182,7 @@ CPython 3.14.7 上 30 个随机整数点约 3–4 秒。该规模符合“离线
 
 ## 测试与独立参考说明
 
-`tests/test_miniball3d.py`（28 个用例）覆盖：单点/两点、共线、共面
+`tests/test_miniball3d.py` 覆盖：单点/两点、共线、共面
 （正方形对角直径）、锐角三角形（3 支撑）、**钝角与直角三角形退化为
 最长边直径**、正四面体（4 支撑等权）、重复点保留多 ID、全部重合、
 30 点上限边界、Fraction 与有限 float 输入、全部输入校验与错误定位、
@@ -145,9 +195,14 @@ budget 耗尽/无解两类异常、不可变性。
 支撑集与重心系数，并对每个结果做精确证书核验（含对偶恒等式）。
 “往返一致”类检查仅作补充。
 
+新增 trimmed 测试还独立枚举小点集的所有排除子集，对每个剩余集合调用测
+试内参考最小球，再与被测结果逐项比较；覆盖对称平局、重复离群位置、共
+线点、所有点相同、自定义原 ID、剩余集合非空和预算未完成状态。
+
 ## 文件清单
 
 - `miniball3d.py` — 本题核心库（可直接 import）。
 - `tests/test_miniball3d.py` — 必要测试 + 独立参考实现。
-- `demo.py` — 固定输入演示（立方体 8 顶点；真实计算 + 真实拒绝边界）。
+- `demo.py` — 固定输入演示（立方体 8 顶点；真实计算、trimmed 证书、
+  真实拒绝边界和预算未完成失败示例）。
 - `README.md`、`requirements.txt`（无第三方依赖）。

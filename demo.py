@@ -10,7 +10,7 @@
 
 from fractions import Fraction
 
-from miniball3d import minimum_enclosing_sphere
+from miniball3d import minimum_enclosing_sphere, trimmed_ball
 
 
 def build_deterministic_points():
@@ -81,6 +81,69 @@ def main():
         print("  -> 没有静默纠正；错误定位到具体参数路径 points[1][1]")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+
+    print()
+    print("=== trimmed_ball(k=1)：一个孤立观测被排除，而不是被统计判定为异常 ===")
+    trimmed_points = [
+        (-1, 0, 0),
+        (0, 0, 0),
+        (2, 0, 0),
+        (0, 2, 0),
+        (0, -2, 0),
+        (10, 0, 0),
+    ]
+    trimmed_ids = ["left", "origin", "right", "top", "bottom", "isolated"]
+    trimmed = trimmed_ball(trimmed_points, 1, ids=trimmed_ids)
+    if not trimmed.complete or trimmed.ball is None:
+        raise AssertionError("未加 budget 的穷举搜索应当完成并找到可行球")
+
+    show("搜索状态", "complete=True（全部候选已枚举）")
+    show("被排除原 ID", str(trimmed.excluded_ids))
+    show("被排除输入位置", str(trimmed.excluded_indices))
+    show("精确中心 c", str(trimmed.center))
+    show("精确半径平方 r^2", str(trimmed.radius_squared))
+    print("剩余点的支撑点与重心证书：")
+    for support in trimmed.support:
+        print(f"  p={support.point}  剩余来源ID={support.ids}  lambda={support.weight}")
+
+    excluded_distance = sum(
+        (
+            trimmed_points[trimmed.excluded_indices[0]][d] - trimmed.center[d]
+        ) ** 2
+        for d in range(3)
+    )
+    retained_ok = all(
+        sum((point[d] - trimmed.center[d]) ** 2 for d in range(3))
+        <= trimmed.radius_squared
+        for i, point in enumerate(trimmed_points)
+        if i not in trimmed.excluded_indices
+    )
+    trimmed_checks = [
+        ("恰好排除球外观测", excluded_distance > trimmed.radius_squared),
+        ("其余观测全部在球内", retained_ok),
+        ("证书平衡残差为 0", trimmed.ball.certificate_residual() == (0, 0, 0)),
+        ("对偶恒等式成立", trimmed.ball.dual_identity_radius_squared() == trimmed.radius_squared),
+        ("剩余集合非空", trimmed.ball.num_input_points >= 1),
+    ]
+    for name, ok in trimmed_checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    assert all(ok for _, ok in trimmed_checks)
+    print("  说明：这是给定 k 后的精确几何最优，不提供概率或统计置信解释。")
+
+    print()
+    print("=== 预算失败示例：只允许检查 1 个候选时状态必须未完成 ===")
+    incomplete = trimmed_ball(trimmed_points, 1, ids=trimmed_ids, budget=1)
+    show(
+        "搜索状态",
+        f"complete={incomplete.complete}, "
+        f"examined={incomplete.examined_candidates}/{incomplete.total_candidates}",
+    )
+    if incomplete.ball is not None:
+        show("当前可行球 r^2", str(incomplete.ball.radius_squared))
+        show("当前排除 ID", str(incomplete.excluded_ids))
+    print("  -> 该球可核验且可行，但搜索未完成，不能声称是全局最优。")
+    assert not incomplete.complete
+    assert incomplete.examined_candidates == 1
 
 
 if __name__ == "__main__":
