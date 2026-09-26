@@ -151,3 +151,90 @@ budget 耗尽/无解两类异常、不可变性。
 - `tests/test_miniball3d.py` — 必要测试 + 独立参考实现。
 - `demo.py` — 固定输入演示（立方体 8 顶点；真实计算 + 真实拒绝边界）。
 - `README.md`、`requirements.txt`（无第三方依赖）。
+
+---
+
+# 本次迭代：受约束包围球（球心限定在指定直线/平面）
+
+在原有 `minimum_enclosing_sphere`（无约束入口，**行为与接口完全不变**，
+不增加离群点预算）之外，新增受约束入口：点仍全部要覆盖，但球心限定
+在调用方给出的直线或平面上。
+
+## 环境准备（venv）
+
+```bash
+python3.14 -m venv .venv        # 仅需 Python 3.14.7，无第三方依赖
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python demo_iteration.py
+```
+
+仓库内 `.venv` 符号链接指向已准备好的运行环境；激活与否均可，直接用
+`.venv/bin/python` 或系统 `python`（3.14.7）运行上述命令。
+
+## 新接口
+
+```python
+from miniball3d import minimum_enclosing_sphere_constrained
+
+result = minimum_enclosing_sphere_constrained(
+    points,
+    subspace_origin=(0, 0, 0),                 # 子空间上一点
+    subspace_directions=[(1, 0, 0), (0, 1, 0)], # 1 个=直线，2 个=平面
+    ids=None, budget=None,                      # 语义同无约束入口
+)
+```
+
+- 球心限定为 `subspace_origin + span(subspace_directions)`；全部输入点
+  仍必须被覆盖。
+- **基向量先做精确秩检查**：零方向、重复或线性相关的方向直接
+  `ValueError` 拒绝（Gram 行列式精确判零），不做静默正交化。
+- **不是**先求自由球心再投影：转到低维坐标后求解带各点法向距离
+  常数项 h_i 的最小最大二次距离 `min_c max_i (|c−x_i|_G² + h_i)`，
+  其中 x_i 为点在子空间中的投影坐标（度量 G = BᵀB），h_i 为法向
+  距离平方。简单投影自由球心一般不再最优（测试
+  `test_not_projection_of_free_center` 专门核对）。
+
+返回 frozen dataclass `ConstrainedMinimumEnclosingSphere`：
+
+| 字段/属性 | 含义 |
+|---|---|
+| `center` / `radius_squared` | 精确球心（保证落在约束子空间上）与 r² |
+| `support` / `weights` | 活动点（`SupportPoint`，含原始 ID 来源）与非负重心系数，和恰为 1 |
+| `subspace_origin` / `subspace_directions` / `subspace_dimension` | 规范化后的约束子空间 |
+| `degenerate_combinations` | 枚举中因活动集投影仿射相关（Gram 奇异）被跳过的候选数；**>0 即数值退化的明确标注** |
+| `contains(p)` / `normal_distance_squared(p)` | 精确包含判定 / 到子空间的法向距离平方 |
+| `certificate_residual()` | Bᵀ·Σλ_i(c−p_i)，低维梯度平衡残差，证书下精确为零向量 |
+| `dual_identity_radius_squared()` | 含 h_i 的对偶恒等式右侧，证书下精确等于 `radius_squared` |
+
+去重按低维键 `(x_i, h_i)` 进行：投影与法向距离都相同的不同三维点合并
+为一个活动点，但全部原始 ID 保留在 `SupportPoint.ids`。
+
+## 错误语义（新增部分）
+
+- 方向个数不是 1 或 2 → `ValueError`；方向含零向量、重复或线性相关
+  → `ValueError`（信息含 `subspace_directions` 定位）。
+- `subspace_origin` / 方向坐标为 `bool` → `TypeError`；为 NaN/Inf →
+  `ValueError`（与点坐标同一套可定位校验）。
+- `budget` 耗尽 → `SearchBudgetExhaustedError`（结果未知）；穷举证明
+  无可行候选 → `NoFeasibleCandidateError`，两者严格分开。
+
+## 核对方式（tests/test_constrained.py，18 个用例）
+
+- 两个点位于平面两侧（投影重合，单活动点合并多 ID）；
+- 活动点不全部落在约束平面内（法向常数项起作用的 3 活动点情形）；
+- 最优中心在直线上的例子（含不过原点的直线、斜平面）；
+- 独立参考实现：三维中直接参数化 c = o + B u，Cramer 行列式求解，
+  不调用被测核心；40 组确定性随机小点集逐字段比对中心与 r²；
+- 每个结果逐点检查覆盖，并精确核验活动点梯度沿子空间方向的凸组合
+  为零、对偶恒等式成立；投影共线等退化情形检查
+  `degenerate_combinations > 0` 的明确标注。
+
+## 新增限制
+
+- 约束子空间仅支持直线（1 个方向）或平面（2 个方向）；不约束（0 个
+  方向）请用原入口，3 个方向无意义，均拒绝。
+- 低维枚举规模为 Σ_{k=1..dim+1} C(m,k)（m 为去重后点数），平面约束
+  为 O(m³)，比无约束入口更快；点数上限同为 30。
+- 演示：`python demo_iteration.py` 现场计算平面约束正常结果、直线
+  约束结果与一个真实拒绝边界（相关方向），远小于 90 秒，无预录、
+  无 sleep。

@@ -402,3 +402,322 @@ def _less(key, best):
     if key[1] != best[1]:
         return key[1] < best[1]
     return key[2] < best[2]
+
+
+# ---------------------------------------------------------------------------
+# 受约束包围球：球心限定在调用方给定的直线或平面上
+# ---------------------------------------------------------------------------
+
+__all__ += [
+    "ConstrainedMinimumEnclosingSphere",
+    "minimum_enclosing_sphere_constrained",
+]
+
+
+@dataclass(frozen=True)
+class ConstrainedMinimumEnclosingSphere:
+    """球心被限制在指定仿射子空间（直线/平面）上的最小包围球结果。
+
+    几何字段均为精确 Fraction。``support`` 中活动点到球心的真实三维距离
+    平方都等于 ``radius_squared``；证书在低维坐标中核验（见
+    ``certificate_residual`` / ``dual_identity_radius_squared``）。
+    """
+
+    center: tuple[Fraction, Fraction, Fraction]
+    radius_squared: Fraction
+    support: tuple[SupportPoint, ...]
+    num_input_points: int
+    num_unique_points: int
+    subspace_origin: tuple[Fraction, Fraction, Fraction]
+    subspace_directions: tuple[tuple[Fraction, Fraction, Fraction], ...]
+    subspace_dimension: int
+    #: 枚举中因活动集投影仿射相关（Gram 奇异）而被跳过的候选数。
+    #: 大于 0 表示输入在约束子空间上的投影存在数值退化情形。
+    degenerate_combinations: int
+
+    @property
+    def weights(self) -> tuple[Fraction, ...]:
+        """与 support 同序的重心系数；和恰为 1，且全部非负。"""
+        return tuple(s.weight for s in self.support)
+
+    @property
+    def center_float(self) -> tuple[float, float, float]:
+        return tuple(float(x) for x in self.center)
+
+    @property
+    def radius_float(self) -> float:
+        return math.sqrt(float(self.radius_squared))
+
+    def contains(self, point) -> bool:
+        """精确判定点是否被球包含（边界算包含）。"""
+        q = _validate_coordinate_sequence(point, where="contains() argument")
+        return _dist2(q, self.center) <= self.radius_squared
+
+    def normal_distance_squared(self, point) -> Fraction:
+        """点到约束子空间的法向距离平方 h（精确）。"""
+        q = _validate_coordinate_sequence(
+            point, where="normal_distance_squared() argument"
+        )
+        _, h = _reduce_point(
+            q, self.subspace_origin, self.subspace_directions, _gram_matrix(
+                self.subspace_directions
+            )
+        )
+        return h
+
+    def certificate_residual(self) -> tuple[Fraction, ...]:
+        """低维梯度平衡残差 B^T * sum_i lambda_i (c - p_i)。
+
+        最优证书下恰为长度 subspace_dimension 的零元组：活动点梯度沿
+        约束子空间方向的凸组合为零（法向分量被子空间约束吸收）。
+        """
+        residual3 = tuple(
+            sum(
+                (s.weight * (self.center[d] - s.point[d]) for s in self.support),
+                Fraction(0),
+            )
+            for d in range(3)
+        )
+        return tuple(
+            sum(residual3[d] * v[d] for d in range(3))
+            for v in self.subspace_directions
+        )
+
+    def dual_identity_radius_squared(self) -> Fraction:
+        """对偶恒等式右侧（低维坐标，含各点法向距离常数项 h_i）。
+
+        等于 sum_i lambda_i (|x_i|_G^2 + h_i) - |sum_i lambda_i x_i|_G^2，
+        最优时与 radius_squared 精确相等。
+        """
+        gram = _gram_matrix(self.subspace_directions)
+        reduced = [
+            _reduce_point(s.point, self.subspace_origin,
+                          self.subspace_directions, gram)
+            for s in self.support
+        ]
+        weighted_norm = sum(
+            (s.weight * (_metric_norm2(x, gram) + h)
+             for s, (x, h) in zip(self.support, reduced)),
+            Fraction(0),
+        )
+        dim = self.subspace_dimension
+        wx = tuple(
+            sum((s.weight * x[j] for s, (x, _h) in zip(self.support, reduced)),
+                Fraction(0))
+            for j in range(dim)
+        )
+        return weighted_norm - _metric_norm2(wx, gram)
+
+
+def _gram_matrix(directions):
+    """方向向量的 Gram 矩阵 G = B^T B（精确）。"""
+    return [
+        [sum(u[d] * v[d] for d in range(3)) for v in directions]
+        for u in directions
+    ]
+
+
+def _metric_norm2(x, gram):
+    """x^T G x：低维坐标在约束子空间度量下的长度平方。"""
+    return sum(
+        x[a] * gram[a][b] * x[b]
+        for a in range(len(x)) for b in range(len(x))
+    )
+
+
+def _metric_dot(x, y, gram):
+    return sum(
+        x[a] * gram[a][b] * y[b]
+        for a in range(len(x)) for b in range(len(y))
+    )
+
+
+def _reduce_point(p, origin, directions, gram):
+    """把三维点分解为低维坐标 x 与法向距离平方 h。
+
+    p - origin = B x + w，B x 在子空间内、w 为法向分量；
+    x = G^{-1} B^T (p - origin)，h = |w|^2。全部精确 Fraction。
+    """
+    delta = tuple(p[d] - origin[d] for d in range(3))
+    rhs = [sum(v[d] * delta[d] for d in range(3)) for v in directions]
+    x = _solve_linear(gram, rhs)
+    if x is None:  # 方向已做秩检查，数学上不可达
+        raise MiniballError("internal: subspace Gram matrix is singular")
+    x = tuple(x)
+    h = _norm2(delta) - _metric_norm2(x, gram)
+    return x, h
+
+
+def _normalize_subspace(origin, directions):
+    """校验并规范化约束子空间；返回 (origin, directions, gram)。
+
+    方向个数必须为 1（直线）或 2（平面），且先做精确秩检查：
+    零方向、重复或线性相关的方向一律拒绝（Gram 行列式为 0）。
+    """
+    o = _validate_coordinate_sequence(origin, where="subspace_origin")
+    if isinstance(directions, (str, bytes)) or not hasattr(directions, "__len__"):
+        raise TypeError("subspace_directions: a sequence of 1 or 2 direction vectors is required")
+    dim = len(directions)
+    if dim not in (1, 2):
+        raise ValueError(
+            f"subspace_directions: exactly 1 (line) or 2 (plane) direction "
+            f"vectors are required, got {dim}"
+        )
+    vecs = tuple(
+        _validate_coordinate_sequence(v, where=f"subspace_directions[{i}]")
+        for i, v in enumerate(directions)
+    )
+    gram = _gram_matrix(vecs)
+    det = gram[0][0] if dim == 1 else gram[0][0] * gram[1][1] - gram[0][1] ** 2
+    if det == 0:
+        raise ValueError(
+            "subspace_directions: direction vectors must be linearly "
+            "independent (zero, duplicate or dependent directions are "
+            "rejected; exact rank check failed)"
+        )
+    return o, vecs, gram
+
+
+def _constrained_candidate(reduced, combo, gram):
+    """低维带法向常数项的等值候选：对活动集求使 |x-x_i|_G^2 + h_i 相等
+    且 x 落在活动集仿射包内的中心；返回 (x, t, weights) 或 None。"""
+    k = len(combo)
+    pts = [reduced[i] for i in combo]
+    x0, h0 = pts[0]
+    if k == 1:
+        return x0, h0, (Fraction(1),)
+
+    vectors = [tuple(pts[j][0][d] - x0[d] for d in range(len(x0)))
+               for j in range(1, k)]
+    size = k - 1
+    gram_sys = [
+        [_metric_dot(vectors[a], vectors[b], gram) for b in range(size)]
+        for a in range(size)
+    ]
+    rhs = [
+        (_metric_norm2(vectors[a], gram) + pts[a + 1][1] - h0) / 2
+        for a in range(size)
+    ]
+    alpha = _solve_linear(gram_sys, rhs)
+    if alpha is None:
+        return None  # 活动集投影仿射相关：数值退化，由调用方计数标注
+
+    center = tuple(
+        x0[d] + sum((alpha[j] * vectors[j][d] for j in range(size)), Fraction(0))
+        for d in range(len(x0))
+    )
+    weights = (Fraction(1) - sum(alpha, Fraction(0)), *alpha)
+    t = _metric_norm2(tuple(center[d] - x0[d] for d in range(len(x0))), gram) + h0
+    return center, t, weights
+
+
+def minimum_enclosing_sphere_constrained(
+    points, *, subspace_origin, subspace_directions, ids=None, budget=None
+) -> ConstrainedMinimumEnclosingSphere:
+    """球心限定在给定直线/平面上的最小包围球（精确，带最优证书）。
+
+    点仍全部要覆盖；球心限定为 subspace_origin + span(subspace_directions)。
+    方法：转到低维坐标后求带各点法向距离常数项 h_i 的最小最大二次距离
+    min_c max_i (|c - x_i|_G^2 + h_i)，不是先求自由球心再投影（投影一般
+    不再最优）。
+
+    Args:
+        points: 同 minimum_enclosing_sphere（1..30 个有理三维点）。
+        subspace_origin: 子空间上一点，3 坐标。
+        subspace_directions: 1 个（直线）或 2 个（平面）方向向量；
+            先做精确秩检查，零/重复/线性相关方向抛 ValueError。
+        ids / budget: 语义同 minimum_enclosing_sphere。
+
+    Returns:
+        ConstrainedMinimumEnclosingSphere：精确中心、r^2、活动点
+        （SupportPoint，含原始 ID 来源与非负重心系数）与最优性证书。
+        degenerate_combinations > 0 时表明枚举中遇到投影仿射相关的
+        退化活动集（已跳过并明确计数）。
+
+    Raises:
+        TypeError / ValueError: 输入或子空间参数非法（含方向相关）。
+        SearchBudgetExhaustedError: budget 耗尽，结果未知。
+        NoFeasibleCandidateError: 穷举证明无可行候选（非空输入下不发生）。
+    """
+    normalized = _normalize_points(points)
+    n = len(normalized)
+    original_ids = _normalize_ids(ids, n)
+    budget_value = _normalize_budget(budget)
+    origin, directions, gram = _normalize_subspace(
+        subspace_origin, subspace_directions
+    )
+    dim = len(directions)
+
+    # 转到低维坐标；按 (x, h) 去重但保留全部原始 ID 来源。
+    provenance: dict[tuple, list] = {}
+    reduced: list[tuple[tuple[Fraction, ...], Fraction]] = []
+    originals: dict[tuple, tuple] = {}
+    for pid, p in zip(original_ids, normalized):
+        key = _reduce_point(p, origin, directions, gram)
+        if key not in provenance:
+            provenance[key] = []
+            reduced.append(key)
+            originals[key] = p
+        provenance[key].append(pid)
+
+    m = len(reduced)
+    best = None  # (t, k, combo, x, weights)
+    degenerate = 0
+    examined = 0
+    for k in range(1, min(dim + 1, m) + 1):
+        for combo in combinations(range(m), k):
+            examined += 1
+            if budget_value is not None and examined > budget_value:
+                raise SearchBudgetExhaustedError(
+                    f"search budget of {budget_value} candidate(s) exhausted "
+                    f"before enumeration completed; result is unknown "
+                    f"(examined {examined - 1}, unique reduced points {m})"
+                )
+            found = _constrained_candidate(reduced, combo, gram)
+            if found is None:
+                degenerate += 1
+                continue
+            x, t, weights = found
+            if any(w < 0 for w in weights):
+                continue  # 中心不在活动集凸包内，不构成最优证书
+            if any(
+                _metric_norm2(
+                    tuple(x[d] - xi[d] for d in range(dim)), gram
+                ) + hi > t
+                for xi, hi in reduced
+            ):
+                continue  # 不能包围全部点
+            key = (t, k, combo)
+            if best is None or _less(key, best):
+                best = (t, k, combo, x, weights)
+
+    if best is None:
+        raise NoFeasibleCandidateError(
+            "exhaustive enumeration proved no feasible constrained enclosing "
+            "sphere exists"
+        )
+
+    t, _k, combo, x, weights = best
+    center = tuple(
+        origin[d] + sum(x[j] * directions[j][d] for j in range(dim))
+        for d in range(3)
+    )
+    support = tuple(
+        SupportPoint(
+            point=originals[reduced[idx]],
+            ids=tuple(provenance[reduced[idx]]),
+            weight=weights[pos],
+        )
+        for pos, idx in enumerate(combo)
+    )
+    return ConstrainedMinimumEnclosingSphere(
+        center=center,
+        radius_squared=t,
+        support=support,
+        num_input_points=n,
+        num_unique_points=m,
+        subspace_origin=origin,
+        subspace_directions=directions,
+        subspace_dimension=dim,
+        degenerate_combinations=degenerate,
+    )
