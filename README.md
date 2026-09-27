@@ -63,6 +63,34 @@ result = minimum_enclosing_sphere(points, *, ids=None, budget=None)
    r² = Σ_i λ_i |p_i|² − |Σ_i λ_i p_i|² = Σ_{i<j} λ_i λ_j |p_i − p_j|²。
 
 这些条件合在一起是最小包围球的标准充要条件（Welzl/凸分析证书）。
+## 动态增删：`DynamicMiniball`
+
+`dynamic_miniball.py` 在一次性求解之上提供可持续插入/删除点的对象：
+
+```python
+from dynamic_miniball import DynamicMiniball
+
+dyn = DynamicMiniball([(0, 0, 0), (4, 0, 0)], ids=["a", "b"])
+dyn2 = dyn.insert((1, 0, 0), point_id="c")   # 返回新版本；dyn 不变
+dyn3 = dyn2.delete("a")                      # 按 ID 删除
+sphere = dyn3.sphere()                       # MinimumEnclosingSphere（含证书）
+```
+
+- **不可变（持久化）**：`insert` / `delete` 返回新对象，旧版本及其已取出
+  的球与证书不受后续修改影响；`ids` / `points` / `len()` / `in` 为只读视图。
+- **复用旧结果的条件**（均为最小包围球充要条件的直接推论）：
+  - 新增点落在旧球内（含边界）→ 旧球仍包含全点集且证书不变，直接复用，
+    不做无谓重算；
+  - 删除点后全部支撑坐标仍在当前点集中（含“该坐标还有其他重复来源 ID”
+    的情形）→ 旧证书在新点集上仍成立，直接复用；
+  - 支撑坐标被彻底删除（决定球边界的点消失）→ 旧球可能不再最优，
+    **对当前点集从头精确重算**，绝不保留旧球冒充最优。
+- 复用时只更新 `num_input_points` / `num_unique_points` 与支撑点的
+  原始 ID 来源；中心、r²、权重原样保留，证书仍可独立核验。
+- **失败不产生部分变更**：非法坐标（NaN/Inf/bool/维度错）、重复或不可
+  哈希 ID、超过 30 点上限、删除不存在的 ID（`KeyError`）都在构造新对象
+  之前抛出，当前点集不变。空集上 `sphere()` 抛 `ValueError`。
+- 未指定 `point_id` 时自动分配未占用的最小非负整数。
 
 ## 算法与设计取舍
 
@@ -132,7 +160,7 @@ CPython 3.14.7 上 30 个随机整数点约 3–4 秒。该规模符合“离线
 
 ## 测试与独立参考说明
 
-`tests/test_miniball3d.py`（28 个用例）覆盖：单点/两点、共线、共面
+`tests/test_miniball3d.py`（28 个用例）与 `tests/test_dynamic_miniball.py`（动态增删用例）覆盖：单点/两点、共线、共面
 （正方形对角直径）、锐角三角形（3 支撑）、**钝角与直角三角形退化为
 最长边直径**、正四面体（4 支撑等权）、重复点保留多 ID、全部重合、
 30 点上限边界、Fraction 与有限 float 输入、全部输入校验与错误定位、
@@ -148,6 +176,7 @@ budget 耗尽/无解两类异常、不可变性。
 ## 文件清单
 
 - `miniball3d.py` — 本题核心库（可直接 import）。
+- `dynamic_miniball.py` — 可持续增删点的动态封装（`DynamicMiniball`）。
 - `tests/test_miniball3d.py` — 必要测试 + 独立参考实现。
 - `demo.py` — 固定输入演示（立方体 8 顶点；真实计算 + 真实拒绝边界）。
 - `README.md`、`requirements.txt`（无第三方依赖）。

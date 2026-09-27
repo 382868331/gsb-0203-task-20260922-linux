@@ -10,6 +10,7 @@
 
 from fractions import Fraction
 
+from dynamic_miniball import DynamicMiniball
 from miniball3d import minimum_enclosing_sphere
 
 
@@ -81,6 +82,43 @@ def main():
         print("  -> 没有静默纠正；错误定位到具体参数路径 points[1][1]")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+
+    print()
+    print("=== 动态增删：复用旧球 + 支撑点删除后重算 ===")
+    dyn = DynamicMiniball(points, ids=ids)
+    base = dyn.sphere()
+    show("初始球心 / r^2", f"{base.center} / {base.radius_squared}")
+
+    # 新增点在旧球内部：复用旧球，不重算
+    dyn_inside = dyn.insert((2, 2, 2), point_id="inner")
+    inside = dyn_inside.sphere()
+    show("插入球心内点 (2,2,2)", "复用旧球（几何不变）"
+         if (inside.center, inside.radius_squared) == (base.center, base.radius_squared)
+         else "意外重算")
+    print(f"  现有点数 {inside.num_input_points}，证书仍满足："
+          f"残差={inside.certificate_residual()}，"
+          f"对偶恒等式成立={inside.dual_identity_radius_squared() == inside.radius_squared}")
+
+    # 删除决定边界的支撑点：必须重算，不能沿用旧球
+    support_id = next(iter(base.support[0].ids))
+    dyn_less = dyn.delete(support_id)
+    shrunk = dyn_less.sphere()
+    show(f"删除支撑点 {support_id!r} 后", f"中心 {shrunk.center}，r^2 {shrunk.radius_squared}")
+    print(f"  与对当前 {shrunk.num_input_points} 个点一次性精确求解一致："
+          f"{(shrunk.center, shrunk.radius_squared) == (minimum_enclosing_sphere(dyn_less.points, ids=dyn_less.ids).center, minimum_enclosing_sphere(dyn_less.points, ids=dyn_less.ids).radius_squared)}")
+
+    # 钝角三角形：球由最长边直径决定，删掉端点后半径真实变小
+    tri = DynamicMiniball([(0, 0, 0), (4, 0, 0), (1, 1, 0)], ids=["a", "b", "c"])
+    tri_less = tri.delete("b")
+    show("钝角三角形删端点 b",
+         f"r^2 从 {tri.sphere().radius_squared} 变为 {tri_less.sphere().radius_squared}")
+
+    # 旧版本不受后续修改影响；失败更新不改变当前点集
+    show("旧版本球心未变", dyn.sphere().center == base.center)
+    try:
+        dyn.delete("no-such-id")
+    except KeyError as exc:
+        print(f"  删除不存在的 ID 实际捕获 KeyError: {exc}；点集仍为 {len(dyn)} 点")
 
 
 if __name__ == "__main__":
