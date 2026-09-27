@@ -40,6 +40,8 @@ __all__ = [
     "MiniballError",
     "NoFeasibleCandidateError",
     "SearchBudgetExhaustedError",
+    "EmptyPointSetError",
+    "DynamicMiniball",
     "minimum_enclosing_sphere",
 ]
 
@@ -61,6 +63,10 @@ class NoFeasibleCandidateError(MiniballError, RuntimeError):
 
 class SearchBudgetExhaustedError(MiniballError, RuntimeError):
     """给定 budget 在枚举完成前耗尽：结果未知，绝不冒充无解或最优。"""
+
+
+class EmptyPointSetError(MiniballError, ValueError):
+    """对空点集查询最小包围球。与输入校验错误同属 ValueError 家族。"""
 
 
 @dataclass(frozen=True)
@@ -402,3 +408,186 @@ def _less(key, best):
     if key[1] != best[1]:
         return key[1] < best[1]
     return key[2] < best[2]
+
+
+# ---------------------------------------------------------------------------
+# 可持续插入 / 删除的增量对象
+# ---------------------------------------------------------------------------
+
+#: sphere() 结果来源的说明字符串（derivation 属性取值）。
+_DERIVE_SCRATCH = "recomputed"          # 全量重算
+_DERIVE_INSERT_INSIDE = "insert-contained"   # 新点落在旧球内，复用旧证书
+_DERIVE_DELETE_FREE = "delete-non-support"   # 删除的不是支撑坐标，复用旧证书
+
+
+class DynamicMiniball:
+    """支持持续插入 / 删除点的最小包围球对象（持久化、不可变版本链）。
+
+    每个实例代表一个确定版本的点集；insert / delete 返回 *新* 版本，
+    旧版本及其查询结果不受后续修改影响（版本间共享不可变数据，绝不
+    原地改写）。任何一步更新失败（非法坐标、重复 / 缺失 ID、超上限）
+    都在产生新版本之前抛出，当前点集保持不变。
+
+    结果复用规则（复用后仍给出当前点集的精确正确球与完整证书）：
+
+    * 插入点 q：若 q 被旧球精确包含，则旧球对新点集仍最优
+      （MEB(S) 是 S∪{q} 的可行球，且任何包围 S∪{q} 的球也包围 S，
+      不可能更小），直接复用旧证书，仅更新计数与 ID 来源。
+    * 删除点 p：若 p 的坐标不是旧证书的支撑坐标（或该坐标仍有其他
+      重复 ID 留存），旧证书对剩余点集依然成立（支撑仍在、其余点
+      仍被包含），直接复用；否则全量重算——绝不把旧球冒充最优。
+    * 复用前会对当前点集做一次完整精确核验（支撑坐标仍在、所有点
+      被包含、权重和非负且为 1），核验不过则自动回退全量重算。
+    """
+
+    __slots__ = ("_entries", "_parent", "_delta", "_sphere", "_derivation")
+
+    def __init__(self, _entries=None, _parent=None, _delta=None):
+        # _entries: 不可再变的 dict(id -> 精确坐标三元组)；只在构造时写入。
+        self._entries = {} if _entries is None else _entries
+        self._parent = _parent
+        self._delta = _delta  # ("insert", id, point) 或 ("delete", id, point)
+        self._sphere = None
+        self._derivation = None
+
+    # -- 只读视图 --------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, pid) -> bool:
+        return pid in self._entries
+
+    @property
+    def ids(self) -> tuple:
+        """当前版本的全部点 ID（插入顺序）。"""
+        return tuple(self._entries)
+
+    @property
+    def derivation(self) -> str | None:
+        """最近一次 sphere() 结果的来源；尚未计算时为 None。"""
+        return self._derivation
+
+    # -- 更新（返回新版本，失败不留下部分变更） --------------------------
+
+    def insert(self, point, *, pid=None) -> "DynamicMiniball":
+        """返回插入 point 后的新版本；当前版本不变。
+
+        pid 缺省时自动取未被占用的最小非负整数。坐标非法、pid 重复
+        或超出 30 点上限时抛错，且当前点集不受任何影响。
+        """
+        coord = _validate_coordinate_sequence(point, where="insert() point")
+        if pid is None:
+            pid = 0
+            while pid in self._entries:
+                pid += 1
+        else:
+            try:
+                already = pid in self._entries
+            except TypeError as exc:
+                raise TypeError(
+                    f"insert() pid: id must be hashable, got {type(pid).__name__}"
+                ) from exc
+            if already:
+                raise ValueError(f"insert() pid: duplicate id {pid!r}")
+        if len(self._entries) >= MIN_BALL_MAX_POINTS:
+            raise ValueError(
+                f"insert(): at most {MIN_BALL_MAX_POINTS} points are allowed"
+            )
+        entries = dict(self._entries)
+        entries[pid] = coord
+        return DynamicMiniball(entries, self, ("insert", pid, coord))
+
+    def delete(self, pid) -> "DynamicMiniball":
+        """返回删除指定 ID 后的新版本；当前版本不变。"""
+        try:
+            coord = self._entries[pid]
+        except TypeError as exc:
+            raise TypeError(
+                f"delete() pid: id must be hashable, got {type(pid).__name__}"
+            ) from exc
+        except KeyError:
+            raise KeyError(f"delete() pid: no such id {pid!r}") from None
+        entries = dict(self._entries)
+        del entries[pid]
+        return DynamicMiniball(entries, self, ("delete", pid, coord))
+
+    # -- 查询 ------------------------------------------------------------
+
+    def sphere(self) -> MinimumEnclosingSphere:
+        """当前点集的最小包围球与最优证书（精确，结果缓存于本版本）。"""
+        if self._sphere is None:
+            self._sphere, self._derivation = self._compute()
+        return self._sphere
+
+    def _compute(self):
+        if not self._entries:
+            raise EmptyPointSetError(
+                "sphere(): cannot compute a minimum enclosing sphere "
+                "of an empty point set"
+            )
+        parent_sphere = None
+        if self._parent is not None:
+            try:
+                parent_sphere = self._parent.sphere()
+            except EmptyPointSetError:
+                parent_sphere = None
+        if parent_sphere is not None:
+            reused = self._try_reuse(parent_sphere)
+            if reused is not None:
+                return reused
+        ids = tuple(self._entries)
+        result = minimum_enclosing_sphere(
+            [self._entries[i] for i in ids], ids=ids
+        )
+        return result, _DERIVE_SCRATCH
+
+    def _try_reuse(self, parent_sphere):
+        kind, _pid, coord = self._delta
+        if kind == "insert":
+            # 新点在旧球内 => 旧球对新点集仍最优（见类 docstring）。
+            if not parent_sphere.contains(coord):
+                return None
+            derivation = _DERIVE_INSERT_INSIDE
+        else:
+            # 删除：只有当被删坐标不再是必要支撑时旧证书才仍然有效。
+            support_coords = {s.point for s in parent_sphere.support}
+            still_present = coord in self._entries.values()
+            if coord in support_coords and not still_present:
+                return None  # 删掉了决定边界的支撑点，必须重算
+            derivation = _DERIVE_DELETE_FREE
+        rebuilt = self._rebuild_certificate(parent_sphere)
+        if rebuilt is None:
+            return None
+        return rebuilt, derivation
+
+    def _rebuild_certificate(self, parent_sphere):
+        """用旧球的中心 / r^2 / 权重对当前点集重建并完整核验证书。"""
+        provenance: dict[tuple, list] = {}
+        for pid, p in self._entries.items():
+            provenance.setdefault(p, []).append(pid)
+        center = parent_sphere.center
+        r2 = parent_sphere.radius_squared
+        support = []
+        for s in parent_sphere.support:
+            ids = provenance.get(s.point)
+            if ids is None:
+                return None  # 支撑坐标已不在当前点集中
+            support.append(
+                SupportPoint(point=s.point, ids=tuple(ids), weight=s.weight)
+            )
+        if any(w < 0 for w in (s.weight for s in support)):
+            return None
+        if sum((s.weight for s in support), Fraction(0)) != 1:
+            return None
+        # 当前点集逐点精确包含核验（复用的最后一道防线）。
+        for p in provenance:
+            if _dist2(p, center) > r2:
+                return None
+        return MinimumEnclosingSphere(
+            center=center,
+            radius_squared=r2,
+            support=tuple(support),
+            num_input_points=len(self._entries),
+            num_unique_points=len(provenance),
+        )

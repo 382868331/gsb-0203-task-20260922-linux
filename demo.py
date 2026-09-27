@@ -10,7 +10,7 @@
 
 from fractions import Fraction
 
-from miniball3d import minimum_enclosing_sphere
+from miniball3d import DynamicMiniball, minimum_enclosing_sphere
 
 
 def build_deterministic_points():
@@ -81,6 +81,50 @@ def main():
         print("  -> 没有静默纠正；错误定位到具体参数路径 points[1][1]")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+
+    print()
+    print("=== 增量更新：小改动复用旧结果，支撑被删必须重算 ===")
+    dyn = DynamicMiniball()
+    for p, pid in zip(points, ids):
+        dyn = dyn.insert(p, pid=pid)
+    base = dyn.sphere()
+    print(f"  初始 8 点: r^2 = {base.radius_squared}  来源={dyn.derivation}")
+
+    # 1) 插入旧球内部的点：复用旧证书，不重算，结果仍是当前点集的正确 MEB。
+    dyn_in = dyn.insert((1, 1, 1), pid="inner")
+    s_in = dyn_in.sphere()
+    print(f"  插入内部点 (1,1,1): r^2 = {s_in.radius_squared}  来源={dyn_in.derivation}")
+    assert dyn_in.derivation == "insert-contained"
+    assert s_in.radius_squared == base.radius_squared
+
+    # 2) 删除非支撑点：复用旧证书。
+    dyn_keep = dyn_in.delete("inner")
+    s_keep = dyn_keep.sphere()
+    print(f"  删除非支撑点 inner: r^2 = {s_keep.radius_squared}  来源={dyn_keep.derivation}")
+    assert dyn_keep.derivation == "delete-non-support"
+
+    # 3) 删除真正决定边界的支撑点：绝不保留旧球冒充最优，必须重算。
+    #    两点球 (0,0,0)-(6,0,0) 由直径两端支撑，删掉一端旧球即失效。
+    pair = DynamicMiniball().insert((0, 0, 0), pid="L").insert((6, 0, 0), pid="R")
+    s_pair = pair.sphere()
+    cut = pair.delete("R")
+    s_cut = cut.sphere()
+    print(f"  两点球 r^2 = {s_pair.radius_squared}；删除支撑点 R 后: "
+          f"r^2 = {s_cut.radius_squared}  来源={cut.derivation}")
+    assert cut.derivation == "recomputed"
+    assert s_cut.radius_squared == 0
+
+    # 4) 持久化：旧版本查询不受后续修改影响。
+    again = dyn.sphere()
+    assert again.center == base.center and again.radius_squared == base.radius_squared
+    print("  旧版本再查询: 结果与修改前完全一致（持久化成立）")
+
+    # 5) 失败更新不改变当前点集。
+    try:
+        dyn.insert((0, 0, 0), pid="v0")  # 重复 ID
+    except ValueError as exc:
+        print(f"  重复 ID 被拒绝: {exc}")
+    assert len(dyn) == 8
 
 
 if __name__ == "__main__":
